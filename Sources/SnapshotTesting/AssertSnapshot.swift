@@ -337,8 +337,7 @@ public func verifySnapshot<Value, Format>(
       if let ext = snapshotting.pathExtension {
         snapshotFileUrl = snapshotFileUrl.appendingPathExtension(ext)
       }
-      let fileManager = FileManager.default
-      try fileManager.createDirectory(at: snapshotDirectoryUrl, withIntermediateDirectories: true)
+      try ensureDirectoryExists(snapshotDirectoryUrl)
 
       let tookSnapshot = XCTestExpectation(description: "Took snapshot")
       var optionalDiffable: Format?
@@ -381,7 +380,7 @@ public func verifySnapshot<Value, Format>(
             if isSwiftTesting {
               #if compiler(>=6.2)
                 recordSwiftTestingAttachment(
-                  writeToDisk ? try Data(contentsOf: snapshotFileUrl) : snapshotData,
+                  snapshotData,
                   named: snapshotFileUrl.lastPathComponent,
                   sourceLocation: SourceLocation(
                     fileID: fileID.description,
@@ -393,24 +392,15 @@ public func verifySnapshot<Value, Format>(
               #endif
             } else {
               XCTContext.runActivity(named: "Attached Recorded Snapshot") { activity in
-                if writeToDisk {
-                  // Snapshot was written to disk. Create attachment from file
-                  let attachment = XCTAttachment(contentsOfFile: snapshotFileUrl)
-                  activity.add(attachment)
-                } else {
-                  // Snapshot was not written to disk. Create attachment from data and path extension
-                  let typeIdentifier = snapshotting.pathExtension.flatMap(
-                    uniformTypeIdentifier(fromExtension:)
-                  )
-
-                  let attachment = XCTAttachment(
-                    uniformTypeIdentifier: typeIdentifier,
-                    name: snapshotFileUrl.lastPathComponent,
-                    payload: snapshotData
-                  )
-
-                  activity.add(attachment)
-                }
+                let typeIdentifier = snapshotting.pathExtension.flatMap(
+                  uniformTypeIdentifier(fromExtension:)
+                )
+                let attachment = XCTAttachment(
+                  uniformTypeIdentifier: typeIdentifier,
+                  name: snapshotFileUrl.lastPathComponent,
+                  payload: snapshotData
+                )
+                activity.add(attachment)
               }
             }
           }
@@ -429,7 +419,7 @@ public func verifySnapshot<Value, Format>(
           """
       }
 
-      guard fileManager.fileExists(atPath: snapshotFileUrl.path) else {
+      guard let data = try readSnapshotData(at: snapshotFileUrl) else {
         if record == .never {
           try recordSnapshot(writeToDisk: false)
 
@@ -449,7 +439,6 @@ public func verifySnapshot<Value, Format>(
         }
       }
 
-      let data = try Data(contentsOf: snapshotFileUrl)
       let reference = snapshotting.diffing.fromData(data)
 
       #if os(iOS) || os(tvOS)
@@ -472,7 +461,7 @@ public func verifySnapshot<Value, Format>(
         isDirectory: true
       )
       let artifactsSubUrl = artifactsUrl.appendingPathComponent(fileName)
-      try fileManager.createDirectory(at: artifactsSubUrl, withIntermediateDirectories: true)
+      try ensureDirectoryExists(artifactsSubUrl)
       let failedSnapshotFileUrl = artifactsSubUrl.appendingPathComponent(
         snapshotFileUrl.lastPathComponent
       )
@@ -630,6 +619,44 @@ enum File {
       defer { lock.unlock() }
       counts.removeAll()
     }
+  }
+}
+
+// Process-wide cache of directories already created during this test run.
+// `FileManager.createDirectory(withIntermediateDirectories: true)` is idempotent but still
+// performs filesystem syscalls each time. On high-latency volumes (e.g. AWS gp3 EBS) this
+// adds up across thousands of assertions.
+private let ensuredDirectoriesLock = NSLock()
+private var ensuredDirectories: Set<URL> = []
+
+private func ensureDirectoryExists(_ url: URL) throws {
+  ensuredDirectoriesLock.lock()
+  if ensuredDirectories.contains(url) {
+    ensuredDirectoriesLock.unlock()
+    return
+  }
+  ensuredDirectoriesLock.unlock()
+  try FileManager.default.createDirectory(at: url, withIntermediateDirectories: true)
+  ensuredDirectoriesLock.lock()
+  ensuredDirectories.insert(url)
+  ensuredDirectoriesLock.unlock()
+}
+
+// Reads a snapshot file, returning `nil` if the file does not exist. Avoids a separate
+// `fileExists` stat by surfacing the missing-file error from `Data(contentsOf:)` and uses
+// `.mappedIfSafe` so the kernel can page the bytes in lazily instead of issuing an eager copy.
+private func readSnapshotData(at url: URL) throws -> Data? {
+  do {
+    return try Data(contentsOf: url, options: .mappedIfSafe)
+  } catch let error as NSError
+    where error.domain == NSCocoaErrorDomain
+    && error.code == CocoaError.fileReadNoSuchFile.rawValue
+  {
+    return nil
+  } catch let error as NSError
+    where error.domain == NSPOSIXErrorDomain && error.code == Int(ENOENT)
+  {
+    return nil
   }
 }
 
