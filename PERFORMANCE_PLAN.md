@@ -20,6 +20,15 @@
     what the PNG round-trip was guarding against.
 - **Phase 4** ✅ code `a3c01cd`, bench `3d6f2e0`. `blendModeDiff` swap to
   `UIGraphicsImageRenderer`. Bench within ±5% noise (expected — fallback path).
+  - Follow-up ✅ commit `4fb3bc9` — pin `format.preferredRange = .standard`
+    so the diff PNG stays sRGB byte-for-byte even on Display P3 devices.
+  - Follow-up ✅ commit `748e6c9` — restore the original
+    `"Actual image precision X is less than required Y"` error wording
+    (Phase 1 had truncated it for the early-exit). Removed the early-exit;
+    `precision-early-fail` regresses ~22ms → ~30ms in exchange for honest reporting.
+- **Phase 5** pending — normalized buffer pool. Low risk / high impact on RSS.
+- **Phase 6** pending — fast-path `context(for:)` for already-normalized images.
+  Highest remaining wall-time impact; depends on Phase 5.
 
 ### Resume context
 
@@ -283,6 +292,143 @@ Notes:
 
 ---
 
+## Phase 5 — Normalized buffer pool (low risk / high impact)
+
+Each `compare()` call allocates two `[UInt8]` buffers sized
+`width * height * 4` for the normalized RGBA renderings. At parallel-8 on
+4096×4096 images this is ~8 × 2 × 64MB ≈ 1GB of transient `[UInt8]` per
+window — visible in the peak RSS climb across phases (5.0GB at parallel-8 in
+Phase 3). A small parallelism-sized pool of reusable buffers, returned after
+each `compare()`, keeps peak RSS flat under load with zero semantic change.
+
+### Changes
+
+1. **`SnapshotTestingByteBufferPool`** in
+   `Sources/SnapshotTesting/Snapshotting/Internal/ImageComparisonResources.swift`.
+   - Pool of `(buffer: UnsafeMutableRawPointer, capacity: Int)` slots.
+   - `acquire(byteCount:) -> Slot` — returns a slot with `capacity >= byteCount`,
+     either reused from the pool or freshly allocated; resizes if the smallest
+     pooled slot is too small.
+   - `release(_ slot: Slot)` — returns the slot for reuse (LIFO so hot buffers
+     stay hot in cache).
+   - Bounded size from `SNAPSHOT_TESTING_BUFFER_POOL_SIZE` (default = clamp of
+     `ProcessInfo.activeProcessorCount * 2` to `[2, 32]`); set to `0` to
+     disable (always fresh allocation).
+   - `@unchecked Sendable`, lock-protected.
+2. **`compare()` rewrites** in both `UIImage.swift` and `NSImage.swift`:
+   - Replace `var oldBytes = [UInt8](repeating: 0, count: byteCount)` with
+     `let oldSlot = pool.acquire(byteCount: byteCount); defer { pool.release(oldSlot) }`.
+   - Pass `oldSlot.buffer` to `context(for:data:)` (already accepts
+     `UnsafeMutableRawPointer?`).
+   - Same for `newBytes`. The precision loop indexes through
+     `oldSlot.buffer.assumingMemoryBound(to: UInt8.self)` (an
+     `UnsafeMutableBufferPointer<UInt8>` of length `byteCount`).
+3. **`normalizedComponentDiff`** also acquires its two normalization buffers
+   from the pool; the `[UInt8]` for `diffBytes` stays Swift-allocated since
+   `vImage_Buffer` and `createCGImage` need a live Swift backing for the
+   produced `CGImage`. (Or: also pool diffBytes if vImage `Buffer_Init` from
+   raw pointer is used. Decide during implementation.)
+4. Document env var in `README.md`.
+
+### Verification
+
+- Bench `--parallel 8` shows flatter / lower peak RSS than Phase 4 across all
+  scenarios; `total_alloc` (if we add the counter) should drop sharply.
+- Wall time should be ≤ Phase 4 (maybe slightly better from cache reuse,
+  certainly not worse).
+- Existing snapshot suite + edge-case tests stay green.
+- New unit tests: pool returns correct-size buffers; pool reuses (same pointer
+  returned after release/acquire); pool grows on contention; `release` is
+  idempotent against double-call; env override works; setting to `0` disables.
+
+### Risks
+
+- Pointer aliasing: a buffer must not be returned while still in use. The
+  `defer { release }` discipline + Swift's strict-mode borrow checking makes
+  this safe in practice, but the unit tests should include a stress harness
+  that fires `concurrentPerform` and verifies no two acquires share a slot.
+- Buffer-size growth: an outlier 16K×16K image followed by 100 small images
+  would keep a 1GB slot pinned. Mitigation: bound `slot.capacity` to
+  `SNAPSHOT_TESTING_BUFFER_POOL_MAX_BYTES` (default 256MB, i.e. 8K×8K RGBA);
+  oversize requests bypass the pool and free immediately.
+
+---
+
+## Phase 6 — Fast-path `context(for:)` for already-normalized images (highest impact)
+
+The hot path always does `CGContext.draw(cgImage, …)` to produce the
+sRGB+RGBA8+premultipliedLast normalized buffer. But reference PNGs (decoded
+via `UIImage(data:)`) and snapshots produced through `UIGraphicsImageRenderer`
+typically arrive in *exactly* that layout already. For those, rasterization
+is wasted work — we could copy bytes straight from the source's
+`dataProvider`. This is the clearest remaining swing on the same hot path
+Phase 3 cracked open.
+
+### Prerequisites
+
+- Phase 5 (buffer pool) should land first. The fast-path still needs a
+  destination buffer for the `memcpy`; the pool keeps it allocation-free.
+- A diverse fixture suite that exercises the layouts we *don't* fast-path
+  (P3, grayscale, non-premultiplied, padded `bytesPerRow`) — already largely
+  present in `ImageNormalizationEdgeCasesTests.swift`; extend with padded-row
+  + 16bpc + indexed-colorspace fixtures so the layout check is provably
+  correct against a comprehensive matrix.
+
+### Changes
+
+1. **`isCanonicalNormalizedLayout(_ cgImage:) -> Bool`** in
+   `Sources/SnapshotTesting/Snapshotting/Internal/ImageComparisonResources.swift`.
+   Returns true iff *all* the following hold:
+   - `cgImage.colorSpace?.name == CGColorSpace.sRGB` (exact match — not
+     `displayP3`, not `extendedSRGB`).
+   - `cgImage.bitsPerComponent == 8`.
+   - `cgImage.bitsPerPixel == 32`.
+   - `cgImage.alphaInfo == .premultipliedLast` (exactly).
+   - `cgImage.byteOrderInfo == .orderDefault` or `.order32Big`.
+   - `cgImage.bytesPerRow == cgImage.width * 4` (no row padding).
+   - `cgImage.bitmapInfo` does *not* contain `.floatComponents`.
+2. **`context(for:data:)` rewrite**: when `data` is non-nil and
+   `isCanonicalNormalizedLayout(cgImage)` returns true, copy bytes directly:
+   ```swift
+   if let provider = cgImage.dataProvider, let cf = provider.data {
+     let src = CFDataGetBytePtr(cf)!
+     memcpy(data, src, byteCount)
+     return nil  // signal: bytes were copied, no CGContext needed
+   }
+   ```
+   Adjust `compare()` callers to handle the "no context needed" return path
+   (they only use the context for its `data` pointer, which was already
+   populated).
+3. Behind a kill-switch env var
+   (`SNAPSHOT_TESTING_DISABLE_NORMALIZED_FASTPATH=1`) for one release in case
+   a project hits a layout the check misclassifies.
+
+### Verification
+
+- Bench: `exact-match-mixed` p50 serial should drop further (current 1.46ms;
+  expect <1ms — most fixtures are sRGB+RGBA8 PNGs); `precision-*` p50
+  similarly. Other scenarios unchanged.
+- Edge-case suite (Phase 3 follow-up) must stay green: P3, grayscale,
+  non-premultiplied images all take the slow path and produce identical
+  output.
+- New parity test: for each canonical-layout fixture, assert
+  `fastPathBytes == drawBasedBytes` (run both paths, byte-compare).
+- Run with `SNAPSHOT_TESTING_DISABLE_NORMALIZED_FASTPATH=1`: bench numbers
+  should match Phase 5 exactly.
+
+### Risks
+
+- Layout-check completeness: missing a subtle bit in `CGImage.bitmapInfo` or
+  misjudging `byteOrderInfo` would silently produce wrong bytes for
+  fast-pathed images. Mitigation: parity test above + start with the strictest
+  possible check (only the *exact* layout `context(for:)` produces today),
+  loosen later if measurement justifies it.
+- Performance regression for borderline-non-canonical images: the layout check
+  is cheap (~10 property reads) but called per `compare()`. Should be
+  unmeasurable, but verify in bench.
+
+---
+
 ## Skipped from source doc
 
 - **#8 pixel-based precision** — deferred per decision above.
@@ -299,6 +445,8 @@ Notes:
 | 3 | Phase 2 (pool + limiter) | low–medium | gain on parallel RSS & CIContext count |
 | 4 | Phase 3 (drop PNG round-trip) | medium | large gain on png-roundtrip & precision RSS; full suite green |
 | 5 | Phase 4 (UIGraphicsImageRenderer) | low | parity |
+| 6 | Phase 5 (normalized buffer pool) | low | flatter peak RSS at parallel-8; wall ≤ Phase 4 |
+| 7 | Phase 6 (fast-path normalized layout) | medium | further drop on `exact-match-mixed` & `precision-*`; full edge-case suite green |
 
 Each PR description includes the bench CSV diff vs. the baseline committed in `bench-baseline/`.
 
