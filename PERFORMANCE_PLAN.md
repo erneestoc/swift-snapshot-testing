@@ -4,8 +4,11 @@
 
 - **Phase 0** ✅ committed `6e3461a`. `SnapshotTestingBenchmarks` executable target,
   `scripts/bench.sh`, baselines under `bench-baseline/pre-phase1-{serial,parallel-4,parallel-8}.csv`.
-- **Phase 1** in progress. Edits applied in working tree, build green, awaiting commit + bench run.
-- **Phase 2/3/4** pending.
+- **Phase 1** ✅ code `8bf1107`, bench `8933727`.
+- **Phase 2** ✅ code `3dd37a1`, bench `e7c8541`. CIContext pool + perceptual diff limiter.
+  Headline: perceptual parallel wall halved vs Phase 1; serial perceptual recovered
+  (was a regression in Phase 1) and now beats baseline.
+- **Phase 3/4** pending.
 
 ### Resume context
 
