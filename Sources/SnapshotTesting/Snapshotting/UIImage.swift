@@ -109,23 +109,25 @@
     guard oldCgImage.width == newCgImage.width, oldCgImage.height == newCgImage.height else {
       return "Newly-taken snapshot@\(new.size) does not match reference@\(old.size)."
     }
-    let pixelCount = oldCgImage.width * oldCgImage.height
-    let byteCount = imageContextBytesPerPixel * pixelCount
-    var oldBytes = [UInt8](repeating: 0, count: byteCount)
-    guard let oldData = context(for: oldCgImage, data: &oldBytes)?.data else {
-      return "Reference image's data could not be loaded."
-    }
 
     if snapshotTestingLegacyNormalization {
-      return legacyCompareTail(
+      return legacyCompare(
         oldCgImage: oldCgImage, newCgImage: newCgImage, new: new,
-        oldBytes: oldBytes, oldData: oldData, byteCount: byteCount,
         precision: precision, perceptualPrecision: perceptualPrecision
       )
     }
 
-    var newBytes = [UInt8](repeating: 0, count: byteCount)
-    guard let newData = context(for: newCgImage, data: &newBytes)?.data else {
+    let pixelCount = oldCgImage.width * oldCgImage.height
+    let byteCount = imageContextBytesPerPixel * pixelCount
+    let pool = SnapshotTestingByteBufferPool.shared
+    let oldSlot = pool.acquire(byteCount: byteCount)
+    defer { pool.release(oldSlot) }
+    guard let oldData = context(for: oldCgImage, data: oldSlot.buffer)?.data else {
+      return "Reference image's data could not be loaded."
+    }
+    let newSlot = pool.acquire(byteCount: byteCount)
+    defer { pool.release(newSlot) }
+    guard let newData = context(for: newCgImage, data: newSlot.buffer)?.data else {
       return "Newly-taken snapshot's data could not be loaded."
     }
     if memcmp(oldData, newData, byteCount) == 0 { return nil }
@@ -144,9 +146,11 @@
     } else {
       let byteCountThreshold = Int((1 - precision) * Float(byteCount))
       var differentByteCount = 0
+      let oldPtr = oldSlot.buffer.assumingMemoryBound(to: UInt8.self)
+      let newPtr = newSlot.buffer.assumingMemoryBound(to: UInt8.self)
       var index = 0
       while index < byteCount {
-        if oldBytes[index] != newBytes[index] {
+        if oldPtr[index] != newPtr[index] {
           differentByteCount += 1
         }
         index += 1
@@ -159,14 +163,19 @@
     return nil
   }
 
-  // Original (pre-Phase-3) compare tail. Kept available behind
+  // Original (pre-Phase-3) compare path. Kept available behind
   // SNAPSHOT_TESTING_LEGACY_NORMALIZATION for one release in case a project
   // hits an edge case the normalized-buffer path doesn't handle.
-  private func legacyCompareTail(
+  private func legacyCompare(
     oldCgImage: CGImage, newCgImage: CGImage, new: UIImage,
-    oldBytes: [UInt8], oldData: UnsafeMutableRawPointer, byteCount: Int,
     precision: Float, perceptualPrecision: Float
   ) -> String? {
+    let pixelCount = oldCgImage.width * oldCgImage.height
+    let byteCount = imageContextBytesPerPixel * pixelCount
+    var oldBytes = [UInt8](repeating: 0, count: byteCount)
+    guard let oldData = context(for: oldCgImage, data: &oldBytes)?.data else {
+      return "Reference image's data could not be loaded."
+    }
     if let newContext = context(for: newCgImage), let newData = newContext.data {
       if memcmp(oldData, newData, byteCount) == 0 { return nil }
     }
@@ -225,6 +234,10 @@
       )
     else { return nil }
 
+    // .copy replaces destination pixels outright; the default .normal blend
+    // would mix translucent source pixels with whatever happens to be in the
+    // destination buffer (random bytes when sourced from the pool).
+    context.setBlendMode(.copy)
     context.draw(cgImage, in: CGRect(x: 0, y: 0, width: cgImage.width, height: cgImage.height))
     return context
   }
@@ -274,13 +287,18 @@ private func normalizedComponentDiff(_ old: UIImage, _ new: UIImage) -> UIImage?
   // per-pixel iteration below sees a predictable layout. Replaces the prior
   // PNG round-trip on the new image, which existed only to canonicalize
   // bitmap layout but is now subsumed by `context(for:)`.
-  var oldNormalized = [UInt8](repeating: 0, count: byteCount)
-  var newNormalized = [UInt8](repeating: 0, count: byteCount)
-  guard context(for: oldCgImage, data: &oldNormalized) != nil,
-        context(for: newCgImage, data: &newNormalized) != nil
+  let pool = SnapshotTestingByteBufferPool.shared
+  let oldSlot = pool.acquire(byteCount: byteCount)
+  defer { pool.release(oldSlot) }
+  let newSlot = pool.acquire(byteCount: byteCount)
+  defer { pool.release(newSlot) }
+  guard context(for: oldCgImage, data: oldSlot.buffer) != nil,
+        context(for: newCgImage, data: newSlot.buffer) != nil
   else {
     return nil
   }
+  let oldNormalized = oldSlot.buffer.assumingMemoryBound(to: UInt8.self)
+  let newNormalized = newSlot.buffer.assumingMemoryBound(to: UInt8.self)
 
   guard let outputColorSpace = CGColorSpace(name: CGColorSpace.linearGray),
         let outputFormat = vImage_CGImageFormat(
