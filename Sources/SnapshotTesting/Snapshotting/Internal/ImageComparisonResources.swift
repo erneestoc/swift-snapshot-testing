@@ -110,11 +110,16 @@
   /// churn per window and shows up as a steady peak-RSS climb. Pooling these
   /// buffers keeps peak RSS flat without changing observable behavior.
   ///
-  /// Pool size is read once from `SNAPSHOT_TESTING_BUFFER_POOL_SIZE` (default
-  /// `clamp(activeProcessorCount * 2, 2, 32)`; set to `0` to disable). Per-slot
-  /// capacity is bounded by `SNAPSHOT_TESTING_BUFFER_POOL_MAX_BYTES` (default
-  /// 256 MB, i.e. one 8K×8K RGBA buffer); larger requests bypass the pool and
-  /// are freed immediately on `release`.
+  /// Pool size is read once from `SNAPSHOT_TESTING_BUFFER_POOL_SIZE`. Default
+  /// is `0` (pool disabled — `acquire` allocates fresh and `release` frees
+  /// immediately). The bulk of Phase 5's wall-time win came from skipping the
+  /// per-call `[UInt8](repeating: 0, ...)` zero-fill, which raw allocation
+  /// preserves; allocator reuse is opt-in because retaining the buffers
+  /// process-wide raises peak RSS — the opposite of Phase 5's stated goal.
+  /// Set to a positive integer to enable buffer reuse (clamped to `[1, 32]`).
+  /// Per-slot capacity is bounded by `SNAPSHOT_TESTING_BUFFER_POOL_MAX_BYTES`
+  /// (default 256 MB, i.e. one 8K×8K RGBA buffer); larger requests bypass the
+  /// pool and are freed immediately on `release`.
   final class SnapshotTestingByteBufferPool: @unchecked Sendable {
     struct Slot {
       let buffer: UnsafeMutableRawPointer
@@ -208,10 +213,7 @@
   }
 
   func parseBufferPoolSize(_ raw: String?) -> Int {
-    guard let raw, let parsed = Int(raw) else {
-      let cores = ProcessInfo.processInfo.activeProcessorCount
-      return min(max(cores * 2, 2), 32)
-    }
+    guard let raw, let parsed = Int(raw) else { return 0 }
     return max(0, min(parsed, 32))
   }
 

@@ -123,10 +123,11 @@
     // MARK: - parseBufferPoolSize
 
     func testParseBufferPoolSize_default() {
-      let cores = ProcessInfo.processInfo.activeProcessorCount
-      let expected = min(max(cores * 2, 2), 32)
-      XCTAssertEqual(parseBufferPoolSize(nil), expected)
-      XCTAssertEqual(parseBufferPoolSize("not-a-number"), expected)
+      // Pool is opt-in: default 0 means acquire allocates fresh and release
+      // frees immediately. This preserves the wall-time win (no zero-fill)
+      // without retaining buffers process-wide.
+      XCTAssertEqual(parseBufferPoolSize(nil), 0)
+      XCTAssertEqual(parseBufferPoolSize("not-a-number"), 0)
     }
 
     func testParseBufferPoolSize_validValues() {
