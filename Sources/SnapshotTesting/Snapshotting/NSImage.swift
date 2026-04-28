@@ -123,11 +123,12 @@
       while index < byteCount {
         if oldBytes[index] != newBytes[index] {
           differentByteCount += 1
-          if differentByteCount > byteCountThreshold {
-            return "Actual image precision is less than required \(precision)"
-          }
         }
         index += 1
+      }
+      if differentByteCount > byteCountThreshold {
+        let actualPrecision = 1 - Float(differentByteCount) / Float(byteCount)
+        return "Actual image precision \(actualPrecision) is less than required \(precision)"
       }
     }
     return nil
@@ -174,11 +175,12 @@
       while index < byteCount {
         if oldBytes[index] != newerBytes[index] {
           differentByteCount += 1
-          if differentByteCount > byteCountThreshold {
-            return "Actual image precision is less than required \(precision)"
-          }
         }
         index += 1
+      }
+      if differentByteCount > byteCountThreshold {
+        let actualPrecision = 1 - Float(differentByteCount) / Float(byteCount)
+        return "Actual image precision \(actualPrecision) is less than required \(precision)"
       }
     }
     return nil
