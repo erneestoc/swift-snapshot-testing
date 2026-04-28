@@ -85,4 +85,20 @@
     guard let raw, let parsed = Int(raw) else { return 2 }
     return parsed
   }
+
+  /// When `true`, image comparison uses the historic PNG round-trip code path
+  /// instead of the Phase 3 normalized-buffer path.
+  ///
+  /// This is an escape hatch in case a project hits a pixel-difference edge
+  /// case the new code path doesn't handle. It's read once at process start
+  /// from `SNAPSHOT_TESTING_LEGACY_NORMALIZATION`. Any of `1`, `true`, `yes`
+  /// (case-insensitive) enables it.
+  let snapshotTestingLegacyNormalization: Bool = parseLegacyNormalizationFlag(
+    ProcessInfo.processInfo.environment["SNAPSHOT_TESTING_LEGACY_NORMALIZATION"]
+  )
+
+  func parseLegacyNormalizationFlag(_ raw: String?) -> Bool {
+    guard let raw = raw?.lowercased(), !raw.isEmpty else { return false }
+    return raw == "1" || raw == "true" || raw == "yes"
+  }
 #endif

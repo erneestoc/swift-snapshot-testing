@@ -115,6 +115,57 @@
     guard let oldData = context(for: oldCgImage, data: &oldBytes)?.data else {
       return "Reference image's data could not be loaded."
     }
+
+    if snapshotTestingLegacyNormalization {
+      return legacyCompareTail(
+        oldCgImage: oldCgImage, newCgImage: newCgImage, new: new,
+        oldBytes: oldBytes, oldData: oldData, byteCount: byteCount,
+        precision: precision, perceptualPrecision: perceptualPrecision
+      )
+    }
+
+    var newBytes = [UInt8](repeating: 0, count: byteCount)
+    guard let newData = context(for: newCgImage, data: &newBytes)?.data else {
+      return "Newly-taken snapshot's data could not be loaded."
+    }
+    if memcmp(oldData, newData, byteCount) == 0 { return nil }
+    if precision >= 1, perceptualPrecision >= 1 {
+      return "Newly-taken snapshot does not match reference."
+    }
+    if perceptualPrecision < 1, #available(iOS 11.0, tvOS 11.0, *) {
+      return SnapshotTestingImageDiffLimiter.shared.run {
+        perceptuallyCompare(
+          CIImage(cgImage: oldCgImage),
+          CIImage(cgImage: newCgImage),
+          pixelPrecision: precision,
+          perceptualPrecision: perceptualPrecision
+        )
+      }
+    } else {
+      let byteCountThreshold = Int((1 - precision) * Float(byteCount))
+      var differentByteCount = 0
+      var index = 0
+      while index < byteCount {
+        if oldBytes[index] != newBytes[index] {
+          differentByteCount += 1
+          if differentByteCount > byteCountThreshold {
+            return "Actual image precision is less than required \(precision)"
+          }
+        }
+        index += 1
+      }
+    }
+    return nil
+  }
+
+  // Original (pre-Phase-3) compare tail. Kept available behind
+  // SNAPSHOT_TESTING_LEGACY_NORMALIZATION for one release in case a project
+  // hits an edge case the normalized-buffer path doesn't handle.
+  private func legacyCompareTail(
+    oldCgImage: CGImage, newCgImage: CGImage, new: UIImage,
+    oldBytes: [UInt8], oldData: UnsafeMutableRawPointer, byteCount: Int,
+    precision: Float, perceptualPrecision: Float
+  ) -> String? {
     if let newContext = context(for: newCgImage), let newData = newContext.data {
       if memcmp(oldData, newData, byteCount) == 0 { return nil }
     }
@@ -143,10 +194,6 @@
     } else {
       let byteCountThreshold = Int((1 - precision) * Float(byteCount))
       var differentByteCount = 0
-      // NB: We are purposely using a verbose 'while' loop instead of a 'for in' loop.  When the
-      //     compiler doesn't have optimizations enabled, like in test targets, a `while` loop is
-      //     significantly faster than a `for` loop for iterating through the elements of a memory
-      //     buffer. Details can be found in [SR-6983](https://github.com/apple/swift/issues/49531)
       var index = 0
       while index < byteCount {
         if oldBytes[index] != newerBytes[index] {
@@ -199,16 +246,31 @@
 
 private func normalizedComponentDiff(_ old: UIImage, _ new: UIImage) -> UIImage? {
   guard let oldCgImage = old.cgImage,
-        let pngData = new.pngData(),
-        let newCgImage = UIImage(data: pngData)?.cgImage,
+        let newCgImage = new.cgImage,
         oldCgImage.width == newCgImage.width,
-        oldCgImage.height == newCgImage.height,
-        let oldData = oldCgImage.dataProvider?.data,
-        let newData = newCgImage.dataProvider?.data
+        oldCgImage.height == newCgImage.height
   else {
     return nil
   }
-  
+
+  let width = oldCgImage.width
+  let height = oldCgImage.height
+  let pixelCount = width * height
+  let byteCount = pixelCount * imageContextBytesPerPixel
+  let scale = old.scale
+
+  // Render both images through the normalized sRGB+RGBA8 context so the
+  // per-pixel iteration below sees a predictable layout. Replaces the prior
+  // PNG round-trip on the new image, which existed only to canonicalize
+  // bitmap layout but is now subsumed by `context(for:)`.
+  var oldNormalized = [UInt8](repeating: 0, count: byteCount)
+  var newNormalized = [UInt8](repeating: 0, count: byteCount)
+  guard context(for: oldCgImage, data: &oldNormalized) != nil,
+        context(for: newCgImage, data: &newNormalized) != nil
+  else {
+    return nil
+  }
+
   guard let outputColorSpace = CGColorSpace(name: CGColorSpace.linearGray),
         let outputFormat = vImage_CGImageFormat(
           bitsPerComponent: imageContextBitsPerComponent,
@@ -219,29 +281,22 @@ private func normalizedComponentDiff(_ old: UIImage, _ new: UIImage) -> UIImage?
   else {
     return nil
   }
-  
-  let width = oldCgImage.width
-  let height = oldCgImage.height
-  let pixelCount = width * height
-  let scale = old.scale
-  
-  let oldBytes = CFDataGetBytePtr(oldData)!
-  let newBytes = CFDataGetBytePtr(newData)!
+
   var diffBytes = [UInt8](repeating: 0, count: pixelCount)
-  
+
   var index = 0
   while index < pixelCount {
     let pixelOffset = index * imageContextBytesPerPixel
-    
-    let rOld = Int16(oldBytes[pixelOffset])
-    let gOld = Int16(oldBytes[pixelOffset + 1])
-    let bOld = Int16(oldBytes[pixelOffset + 2])
-    let aOld = Int16(oldBytes[pixelOffset + 3])
-    
-    let rNew = Int16(newBytes[pixelOffset])
-    let gNew = Int16(newBytes[pixelOffset + 1])
-    let bNew = Int16(newBytes[pixelOffset + 2])
-    let aNew = Int16(newBytes[pixelOffset + 3])
+
+    let rOld = Int16(oldNormalized[pixelOffset])
+    let gOld = Int16(oldNormalized[pixelOffset + 1])
+    let bOld = Int16(oldNormalized[pixelOffset + 2])
+    let aOld = Int16(oldNormalized[pixelOffset + 3])
+
+    let rNew = Int16(newNormalized[pixelOffset])
+    let gNew = Int16(newNormalized[pixelOffset + 1])
+    let bNew = Int16(newNormalized[pixelOffset + 2])
+    let aNew = Int16(newNormalized[pixelOffset + 3])
     
     let rDiff = abs(rOld - rNew)
     let gDiff = abs(gOld - gNew)

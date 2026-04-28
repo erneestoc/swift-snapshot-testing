@@ -172,6 +172,13 @@ unaffected.
     perceptual path contends for a single GPU on most hardware, so capping
     concurrency improves total throughput and bounds memory.
 
+  - `SNAPSHOT_TESTING_LEGACY_NORMALIZATION` — set to `1`/`true`/`yes` to
+    fall back to the historic PNG round-trip code path inside `compare()`.
+    The default path renders both images through a normalized
+    sRGB+RGBA8+premultipliedLast `CGContext` once, which subsumes what the
+    PNG round-trip used to do and avoids the codec cost. Use this only if
+    you hit a regression — and please file an issue.
+
 ## Documentation
 
 The latest documentation is available
