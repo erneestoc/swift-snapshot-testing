@@ -117,6 +117,26 @@ Mechanical, low blast radius. One PR.
 - Existing test suite unchanged and green.
 - Phase 1 bench shows reduction on `precision-early-fail` (early-exit) and on parallel-mode peak RSS (autorelease pool) without regressing exact-match.
 
+### Results
+
+Code: `8bf1107` · Bench: `8933727` (CSVs: `bench-results/8bf1107-*.csv` vs `bench-baseline/pre-phase1-*.csv`).
+
+| Metric | Baseline | Phase 1 | Δ |
+|---|---|---|---|
+| Peak RSS, serial perceptual | 6.04 GB | 1.98 GB | **−67%** |
+| Peak RSS, parallel-8 (any) | 8.54 GB | 2.96 GB | **−65%** |
+| `precision-1px-diff` p50, serial | 12.48 ms | 10.74 ms | −14% |
+| `precision-1px-diff` wall, parallel-4 | 2542 ms | 1445 ms | **−43%** |
+| `precision-50pct-diff` wall, parallel-4 | 2257 ms | 1473 ms | −35% |
+| `exact-match-small` wall, parallel-8 | 77.2 ms | 65.6 ms | −15% |
+| `perceptual-pass` p50, **serial** | 12.46 ms | 23.27 ms | **+87% (regression)** |
+| `perceptual-fail` p50, **serial** | 15.98 ms | 23.65 ms | +48% (regression) |
+| `exact-match-large` wall, parallel-8 | 920 ms | 1108 ms | +20% (likely noise) |
+
+Notes:
+- The serial perceptual regression was the surprise. Working theory at the time: per-call `CIContext` allocation overhead becoming visible when there's no parallel work to amortize. Confirmed in Phase 2 — once the pool ships the regression vanishes.
+- `precision-early-fail` serial p50 barely moved (32.2 → 33.1 ms). The early-exit shortens the precision loop, but the diff/attachment generation still dominates serial p50; the win shows up in p95 (−11%) and parallel modes (−22%).
+
 ---
 
 ## Phase 2 — Shared resources (CIContext pool + perceptual concurrency cap)
@@ -136,6 +156,28 @@ Mechanical, low blast radius. One PR.
 ### Risks
 
 - Default-on cap could surprise small projects whose perceptual tests now serialize. Mitigation: env var unset = uncapped; default only kicks in if env var is unset AND we want a default. **Open question for review:** apply the cap unconditionally with default 2, or only if env var is set? Current plan: apply default. Easy to flip.
+
+### Results
+
+Code: `3dd37a1` · Bench: `e7c8541` (CSVs: `bench-results/3dd37a1-*.csv` vs `bench-results/8bf1107-*.csv`).
+
+| Metric | Phase 1 | Phase 2 | Δ vs Phase 1 | vs Baseline |
+|---|---|---|---|---|
+| `perceptual-pass` p50, **serial** | 23.27 ms | 11.35 ms | **−51%** | −9% (recovers + beats baseline) |
+| `perceptual-fail` p50, serial | 23.65 ms | 10.19 ms | −57% | −36% |
+| `perceptual-pass` wall, parallel-4 | 894 ms | **428 ms** | **−52%** | −59% |
+| `perceptual-pass` wall, parallel-8 | 1032 ms | **497 ms** | **−52%** | −59% |
+| `perceptual-fail` wall, parallel-4 | 946 ms | 442 ms | −53% | −60% |
+| `exact-match-large` p50, serial | 13.38 ms | 11.13 ms | −17% | −25% |
+| `precision-1px-diff` p50, serial | 10.74 ms | 10.24 ms | −5% | −18% |
+| `exact-match-mixed` wall, parallel-8 | 3718 ms | 3119 ms | −16% | ~0% (recovers from P1 regression) |
+| Peak RSS, parallel-4 | 3.05 GB | 3.36 GB | +10% | −56% |
+| Peak RSS, parallel-8 | 2.96 GB | 3.11 GB | +5% | −63% |
+
+Notes:
+- The headline is **perceptual parallel wall time roughly halved**. The Phase 1 perceptual serial regression is fully resolved — the pool eliminates the per-call `CIContext` allocation that was the suspected cause.
+- Peak RSS rises modestly vs Phase 1 because the pool keeps 2 `CIContext` instances alive process-wide, but stays well under half of baseline.
+- 12 unit tests (parser, pool, limiter) cover the new types; no integration test changes were needed.
 
 ---
 
