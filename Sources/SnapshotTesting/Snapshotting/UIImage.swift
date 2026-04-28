@@ -238,6 +238,11 @@
     let format = UIGraphicsImageRendererFormat()
     format.scale = max(old.scale, new.scale)
     format.opaque = true
+    // Pin to sRGB to match the byte output of the previous
+    // UIGraphicsBeginImageContextWithOptions path. Without this, .automatic
+    // produces Display P3 PNGs on supported displays — visually identical but
+    // byte-different from prior releases.
+    format.preferredRange = .standard
     let renderer = UIGraphicsImageRenderer(
       size: CGSize(width: width, height: height),
       format: format
