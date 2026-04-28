@@ -1,5 +1,26 @@
 # UIImage / NSImage Snapshot Performance Plan
 
+## Progress log (resumable)
+
+- **Phase 0** ✅ committed `6e3461a`. `SnapshotTestingBenchmarks` executable target,
+  `scripts/bench.sh`, baselines under `bench-baseline/pre-phase1-{serial,parallel-4,parallel-8}.csv`.
+- **Phase 1** in progress. Edits applied in working tree, build green, awaiting commit + bench run.
+- **Phase 2/3/4** pending.
+
+### Resume context
+
+- Bench script needs Xcode platform frameworks at runtime; the script auto-sets
+  `DYLD_FRAMEWORK_PATH` / `DYLD_LIBRARY_PATH` from `xcrun --show-sdk-platform-path`.
+- Pre-existing local test failure to ignore: `testNSImage` (gated to non-CI; host rendering quirk,
+  reproduces on clean main).
+- Per-phase rollout: commit, then `BENCH_OUT_DIR=bench-results ./scripts/bench.sh`, then commit
+  the CSVs. Compare against `bench-baseline/`. The bench script tags filenames with the git SHA.
+- The PNG round-trip (Phase 3) hot lines: `UIImage.swift:119-127`, `NSImage.swift:94-101`.
+- The CIContext-per-call site (Phase 2): `UIImage.swift:303` inside `perceptuallyCompare`.
+  Counter leak warning ("Context leak detected") visible in baseline confirms the issue.
+
+
+
 Source: `~/Downloads/swift-snapshot-testing-uiimage-optimizations.md`.
 Targets: `Sources/SnapshotTesting/Snapshotting/UIImage.swift`, `Sources/SnapshotTesting/Snapshotting/NSImage.swift`.
 Goal: lower CPU / peak RSS / GPU contention in highly parallel CI snapshot runs without changing user-visible behavior.

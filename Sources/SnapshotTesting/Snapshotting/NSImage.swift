@@ -20,18 +20,20 @@
         toData: { NSImagePNGRepresentation($0)! },
         fromData: { NSImage(data: $0)! }
       ) { old, new in
-        guard
-          let message = compare(
-            old, new, precision: precision, perceptualPrecision: perceptualPrecision)
-        else { return nil }
-        let difference = SnapshotTesting.diff(old, new)
-        let oldAttachment = DiffAttachment.data(NSImagePNGRepresentation(old)!, name: "reference.png")
-        let newAttachment = DiffAttachment.data(NSImagePNGRepresentation(new)!, name: "failure.png")
-        let differenceAttachment = DiffAttachment.data(NSImagePNGRepresentation(difference)!, name: "difference.png")
-        return (
-          message,
-          [oldAttachment, newAttachment, differenceAttachment]
-        )
+        autoreleasepool {
+          guard
+            let message = compare(
+              old, new, precision: precision, perceptualPrecision: perceptualPrecision)
+          else { return nil }
+          let difference = SnapshotTesting.diff(old, new)
+          let oldAttachment = DiffAttachment.data(NSImagePNGRepresentation(old)!, name: "reference.png")
+          let newAttachment = DiffAttachment.data(NSImagePNGRepresentation(new)!, name: "failure.png")
+          let differenceAttachment = DiffAttachment.data(NSImagePNGRepresentation(difference)!, name: "difference.png")
+          return (
+            message,
+            [oldAttachment, newAttachment, differenceAttachment]
+          )
+        }
       }
     }
   }
@@ -121,14 +123,13 @@
       //     buffer. Details can be found in [SR-6983](https://github.com/apple/swift/issues/49531)
       var index = 0
       while index < byteCount {
-        defer { index += 1 }
         if oldRep[index] != newRep[index] {
           differentByteCount += 1
+          if differentByteCount > byteCountThreshold {
+            return "Actual image precision is less than required \(precision)"
+          }
         }
-      }
-      if differentByteCount > byteCountThreshold {
-        let actualPrecision = 1 - Float(differentByteCount) / Float(byteCount)
-        return "Actual image precision \(actualPrecision) is less than required \(precision)"
+        index += 1
       }
     }
     return nil

@@ -30,22 +30,24 @@
         toData: toData,
         fromData: { UIImage(data: $0, scale: imageScale)! }
       ) { old, new in
-        guard
-          let message = compare(
-            old, new, precision: precision, perceptualPrecision: perceptualPrecision)
-        else { return nil }
-        let difference = SnapshotTesting.diff(old, new)
-        let isEmptyImage = new.size == .zero
-        let referenceAttachment = DiffAttachment.data(toData(old), name: "reference.png")
-        let failureAttachment = DiffAttachment.data(
-          toData(isEmptyImage ? emptyImage() : new),
-          name: "failure.png"
-        )
-        let differenceAttachment = DiffAttachment.data(toData(difference), name: "difference.png")
-        return (
-          message,
-          [referenceAttachment, failureAttachment, differenceAttachment]
-        )
+        autoreleasepool {
+          guard
+            let message = compare(
+              old, new, precision: precision, perceptualPrecision: perceptualPrecision)
+          else { return nil }
+          let difference = SnapshotTesting.diff(old, new)
+          let isEmptyImage = new.size == .zero
+          let referenceAttachment = DiffAttachment.data(toData(old), name: "reference.png")
+          let failureAttachment = DiffAttachment.data(
+            toData(isEmptyImage ? emptyImage() : new),
+            name: "failure.png"
+          )
+          let differenceAttachment = DiffAttachment.data(toData(difference), name: "difference.png")
+          return (
+            message,
+            [referenceAttachment, failureAttachment, differenceAttachment]
+          )
+        }
       }
     }
 
@@ -145,14 +147,13 @@
       //     buffer. Details can be found in [SR-6983](https://github.com/apple/swift/issues/49531)
       var index = 0
       while index < byteCount {
-        defer { index += 1 }
         if oldBytes[index] != newerBytes[index] {
           differentByteCount += 1
+          if differentByteCount > byteCountThreshold {
+            return "Actual image precision is less than required \(precision)"
+          }
         }
-      }
-      if differentByteCount > byteCountThreshold {
-        let actualPrecision = 1 - Float(differentByteCount) / Float(byteCount)
-        return "Actual image precision \(actualPrecision) is less than required \(precision)"
+        index += 1
       }
     }
     return nil
@@ -228,7 +229,6 @@ private func normalizedComponentDiff(_ old: UIImage, _ new: UIImage) -> UIImage?
   
   var index = 0
   while index < pixelCount {
-    defer { index += 1 }
     let pixelOffset = index * imageContextBytesPerPixel
     
     let rOld = Int16(oldBytes[pixelOffset])
@@ -248,6 +248,7 @@ private func normalizedComponentDiff(_ old: UIImage, _ new: UIImage) -> UIImage?
     
     let maxDiff = max(rDiff, gDiff, bDiff, aDiff)
     diffBytes[index] = UInt8(maxDiff)
+    index += 1
   }
   
   let outputCgImage: CGImage? = diffBytes.withUnsafeMutableBytes { diffPtr in
@@ -339,11 +340,9 @@ private func normalizedComponentDiff(_ old: UIImage, _ new: UIImage) -> UIImage?
       let componentStride = MemoryLayout<Float>.stride
       var line = 0
       while line < buffer.height {
-        defer { line += 1 }
         let lineOffset = buffer.rowBytes * line
         var column = 0
         while column < buffer.width {
-          defer { column += 1 }
           let byteOffset = lineOffset + column * componentStride
           let deltaE = buffer.data.load(fromByteOffset: byteOffset, as: Float.self)
           if deltaE > deltaThreshold {
@@ -352,7 +351,9 @@ private func normalizedComponentDiff(_ old: UIImage, _ new: UIImage) -> UIImage?
               maximumDeltaE = deltaE
             }
           }
+          column += 1
         }
+        line += 1
       }
       let failingPixelPercent =
         Float(failingPixelCount)
