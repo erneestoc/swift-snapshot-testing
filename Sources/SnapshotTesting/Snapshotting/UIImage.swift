@@ -132,12 +132,14 @@
       return "Newly-taken snapshot does not match reference."
     }
     if perceptualPrecision < 1, #available(iOS 11.0, tvOS 11.0, *) {
-      return perceptuallyCompare(
-        CIImage(cgImage: oldCgImage),
-        CIImage(cgImage: newCgImage),
-        pixelPrecision: precision,
-        perceptualPrecision: perceptualPrecision
-      )
+      return SnapshotTestingImageDiffLimiter.shared.run {
+        perceptuallyCompare(
+          CIImage(cgImage: oldCgImage),
+          CIImage(cgImage: newCgImage),
+          pixelPrecision: precision,
+          perceptualPrecision: perceptualPrecision
+        )
+      }
     } else {
       let byteCountThreshold = Int((1 - precision) * Float(byteCount))
       var differentByteCount = 0
@@ -301,7 +303,7 @@ private func normalizedComponentDiff(_ old: UIImage, _ new: UIImage) -> UIImage?
     let deltaOutputImage = old.applyingLabDeltaE(new)
     // Setting the working color space and output color space to NSNull disables color management. This is appropriate when the output
     // of the operations is computational instead of an image intended to be displayed.
-    let context = CIContext(options: [.workingColorSpace: NSNull(), .outputColorSpace: NSNull()])
+    let context = SnapshotTestingCIContextPool.shared.next()
     let deltaThreshold = (1 - perceptualPrecision) * 100
     let actualPixelPrecision: Float
     var maximumDeltaE: Float = 0

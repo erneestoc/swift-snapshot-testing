@@ -154,6 +154,24 @@ assertSnapshot(of: user, as: .dump)
 
 If your data can be represented as an image, text, or data, you can write a snapshot test for it!
 
+## Environment variables
+
+A few environment variables tune resource usage of the image-diff path. They only
+affect `UIImage` / `NSImage` snapshot comparisons; all other strategies are
+unaffected.
+
+  - `SNAPSHOT_TESTING_CI_CONTEXT_POOL_SIZE` — number of pooled `CIContext`
+    instances reused across perceptual diff calls. Default `2`, clamped to
+    `[1, 4]`. The previous behavior allocated a fresh `CIContext` per
+    comparison, which caused "Context leak detected" warnings and elevated
+    peak RSS in highly parallel test runs.
+
+  - `SNAPSHOT_TESTING_PERCEPTUAL_DIFF_CONCURRENCY` — maximum number of
+    perceptual image comparisons that may run concurrently. Default `2`,
+    clamped to `[1, 16]`. Set to `0` to disable the limiter entirely. The
+    perceptual path contends for a single GPU on most hardware, so capping
+    concurrency improves total throughput and bounds memory.
+
 ## Documentation
 
 The latest documentation is available

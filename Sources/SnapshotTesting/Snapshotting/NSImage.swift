@@ -106,12 +106,14 @@
       return "Newly-taken snapshot does not match reference."
     }
     if perceptualPrecision < 1, #available(macOS 10.13, *) {
-      return perceptuallyCompare(
-        CIImage(cgImage: oldCgImage),
-        CIImage(cgImage: newCgImage),
-        pixelPrecision: precision,
-        perceptualPrecision: perceptualPrecision
-      )
+      return SnapshotTestingImageDiffLimiter.shared.run {
+        perceptuallyCompare(
+          CIImage(cgImage: oldCgImage),
+          CIImage(cgImage: newCgImage),
+          pixelPrecision: precision,
+          perceptualPrecision: perceptualPrecision
+        )
+      }
     } else {
       let oldRep = NSBitmapImageRep(cgImage: oldCgImage).bitmapData!
       let newRep = NSBitmapImageRep(cgImage: newerCgImage).bitmapData!
