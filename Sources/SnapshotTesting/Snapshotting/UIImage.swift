@@ -235,13 +235,17 @@
   private func blendModeDiff(_ old: UIImage, _ new: UIImage) -> UIImage {
     let width = max(old.size.width, new.size.width)
     let height = max(old.size.height, new.size.height)
-    let scale = max(old.scale, new.scale)
-    UIGraphicsBeginImageContextWithOptions(CGSize(width: width, height: height), true, scale)
-    new.draw(at: .zero)
-    old.draw(at: .zero, blendMode: .difference, alpha: 1)
-    let differenceImage = UIGraphicsGetImageFromCurrentImageContext()!
-    UIGraphicsEndImageContext()
-    return differenceImage
+    let format = UIGraphicsImageRendererFormat()
+    format.scale = max(old.scale, new.scale)
+    format.opaque = true
+    let renderer = UIGraphicsImageRenderer(
+      size: CGSize(width: width, height: height),
+      format: format
+    )
+    return renderer.image { _ in
+      new.draw(at: .zero)
+      old.draw(at: .zero, blendMode: .difference, alpha: 1)
+    }
   }
 
 private func normalizedComponentDiff(_ old: UIImage, _ new: UIImage) -> UIImage? {
