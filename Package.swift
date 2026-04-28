@@ -65,6 +65,11 @@ let package = Package(
         .product(name: "CustomDump", package: "swift-custom-dump"),
       ]
     ),
+    .executableTarget(
+      name: "SnapshotTestingBenchmarks",
+      dependencies: ["SnapshotTesting"],
+      path: "Sources/SnapshotTestingBenchmarks"
+    ),
   ],
   swiftLanguageModes: [.v5]
 )
