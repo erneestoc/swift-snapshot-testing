@@ -8,7 +8,15 @@
 - **Phase 2** ✅ code `3dd37a1`, bench `e7c8541`. CIContext pool + perceptual diff limiter.
   Headline: perceptual parallel wall halved vs Phase 1; serial perceptual recovered
   (was a regression in Phase 1) and now beats baseline.
-- **Phase 3/4** pending.
+- **Phase 3** ✅ code `255b526`, bench `d39b74e`. Drop PNG round-trip in `compare()`
+  + `normalizedComponentDiff()`; normalize NSImage's `context(for:)` to match UIImage's
+  (sRGB+8bpc+RGBA8). Headline: precision-1px-diff p50 serial **−84%**, parallel-4
+  wall **−89%**; exact-match-large p50 serial **−59%**. Legacy path gated behind
+  `SNAPSHOT_TESTING_LEGACY_NORMALIZATION=1` for one release.
+  - Follow-up still owed: targeted edge-case tests (non-premultiplied alpha,
+    non-sRGB colorspace, grayscale) called out in Phase 3 verification — full
+    79-test suite passes but these focused cases were not added.
+- **Phase 4** pending.
 
 ### Resume context
 
@@ -199,6 +207,35 @@ Notes:
 ### Rollback strategy
 
 - Keep the PNG round-trip code on a feature flag (`SNAPSHOT_TESTING_LEGACY_NORMALIZATION=1`) for one release, then remove.
+
+### Results
+
+Code: `255b526` · Bench: `d39b74e` (CSVs: `bench-results/255b526-*.csv` vs `bench-results/3dd37a1-*.csv`).
+
+| Metric | Phase 2 | Phase 3 | Δ vs Phase 2 | vs Baseline |
+|---|---|---|---|---|
+| `precision-1px-diff` p50, serial | 10.24 ms | **1.64 ms** | **−84%** | **−87%** |
+| `precision-50pct-diff` p50, serial | 10.43 ms | 1.89 ms | −82% | −85% |
+| `precision-1px-diff` wall, parallel-4 | 1382 ms | **152 ms** | **−89%** | **−94%** |
+| `precision-50pct-diff` wall, parallel-4 | 1392 ms | 162 ms | −88% | −93% |
+| `precision-1px-diff` wall, parallel-8 | 1358 ms | 174 ms | −87% | −90% |
+| `exact-match-large` p50, serial | 11.13 ms | 4.56 ms | −59% | −69% |
+| `exact-match-large` wall, parallel-4 | 1131 ms | 316 ms | −72% | −70% |
+| `exact-match-mixed` p50, serial | 3.13 ms | 1.71 ms | −45% | −55% |
+| `exact-match-mixed` wall, parallel-4 | 3406 ms | 1134 ms | −67% | −65% |
+| `perceptual-pass` p50, serial | 11.35 ms | 5.82 ms | −49% | −53% |
+| `perceptual-pass` wall, parallel-4 | 428 ms | 293 ms | −32% | −72% |
+| `perceptual-fail` wall, parallel-4 | 442 ms | 334 ms | −24% | −69% |
+| `precision-early-fail` p50, serial | 35.29 ms | 22.41 ms | −37% | −31% |
+| Peak RSS, parallel-4 | 3.36 GB | 4.19 GB | +25% | −45% |
+| Peak RSS, parallel-8 | 3.11 GB | 5.03 GB | +62% | −41% |
+
+Notes:
+- The dominant win is the precision path: dropping the PNG round-trip removes a full encode + decode + render per failing exact-match, and the precision loop now reads the same buffer that fed `memcmp` (no second buffer to populate).
+- Exact-match scenarios also benefit because the failure path is shorter (single render) and the success path is unchanged.
+- Peak RSS rises modestly because the new `newBytes` buffer is held alive through the precision loop instead of being freed after the first `memcmp`. Still well below baseline (8.5 GB → 5.0 GB at parallel-8). Net trade is excellent given the wall-time reduction.
+- NSImage's `context(for:)` was rewritten to the normalized form (sRGB+8bpc+RGBA8+tight `bytesPerRow`). UIImage already had this from `d5962c2` (#446, 2021); NSImage was still using the source CGImage's own layout, which is why dropping its PNG round-trip required this prerequisite.
+- Legacy path retained behind `SNAPSHOT_TESTING_LEGACY_NORMALIZATION=1`. Targeted edge-case tests (non-premultiplied alpha, non-sRGB colorspace, grayscale) are still owed.
 
 ---
 
