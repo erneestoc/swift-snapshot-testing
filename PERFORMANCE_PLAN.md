@@ -26,7 +26,15 @@
     `"Actual image precision X is less than required Y"` error wording
     (Phase 1 had truncated it for the early-exit). Removed the early-exit;
     `precision-early-fail` regresses ~22ms → ~30ms in exchange for honest reporting.
-- **Phase 5** pending — normalized buffer pool. Low risk / high impact on RSS.
+- **Phase 5** ✅ code `c6b7d9e`. `SnapshotTestingByteBufferPool` (LIFO,
+  size-bounded, `SNAPSHOT_TESTING_BUFFER_POOL_SIZE` / `_MAX_BYTES`).
+  Required pinning `context(for:)` to `.copy` blend mode so the uninitialized
+  pool memory doesn't blend with translucent source pixels — caught by
+  `ImageNormalizationEdgeCasesTests.testNonPremultipliedAlpha_identicalImagesPass`.
+  Headline: serial `precision-1px-diff` p50 −29%, parallel-4 wall −31%;
+  `exact-match-large` serial p50 −33%. Trade-off: peak RSS on
+  `exact-match-mixed` rises (pool retains hot buffers) but stays well below
+  the original baseline.
 - **Phase 6** pending — fast-path `context(for:)` for already-normalized images.
   Highest remaining wall-time impact; depends on Phase 5.
 
@@ -351,6 +359,50 @@ each `compare()`, keeps peak RSS flat under load with zero semantic change.
   would keep a 1GB slot pinned. Mitigation: bound `slot.capacity` to
   `SNAPSHOT_TESTING_BUFFER_POOL_MAX_BYTES` (default 256MB, i.e. 8K×8K RGBA);
   oversize requests bypass the pool and free immediately.
+
+### Results
+
+Code: `c6b7d9e` · Bench: tracked under `bench-results/c6b7d9e-*.csv`
+(vs `bench-results/a3c01cd-*.csv`).
+
+| Metric | Phase 4 | Phase 5 | Δ vs Phase 4 |
+|---|---|---|---|
+| `exact-match-large` p50, serial | 4.53 ms | 3.02 ms | **−33%** |
+| `exact-match-large` wall, parallel-4 | 323 ms | 271 ms | −16% |
+| `exact-match-mixed` p50, serial | 1.46 ms | 1.31 ms | −11% |
+| `exact-match-mixed` wall, parallel-8 | 1277 ms | 1165 ms | −9% |
+| `exact-match-small` p50, serial | 13.8 µs | 10.5 µs | −24% |
+| `precision-1px-diff` p50, serial | 1.75 ms | 1.25 ms | **−29%** |
+| `precision-1px-diff` wall, parallel-4 | 173 ms | 120 ms | **−31%** |
+| `precision-50pct-diff` p50, serial | 1.96 ms | 1.27 ms | **−35%** |
+| `precision-50pct-diff` wall, parallel-4 | 166 ms | 136 ms | −18% |
+| `precision-early-fail` p50, serial | 23.58 ms | 24.28 ms | +3% (noise) |
+| `perceptual-pass` p50, serial | 6.07 ms | 6.16 ms | +1% (noise) |
+| `perceptual-fail` p50, serial | 6.03 ms | 6.23 ms | +3% (noise) |
+| Peak RSS, parallel-4 (exact-match-mixed) | 4.75 GB | 6.37 GB | +34% |
+| Peak RSS, parallel-8 (exact-match-mixed) | 4.65 GB | 6.21 GB | +33% |
+
+Notes:
+- Wall-time wins are dominated by skipping the `[UInt8](repeating: 0, count:)`
+  zero-fill on every call. The pool both avoids the allocation *and* avoids
+  the memset; the latter is the bigger cut for the precision scenarios.
+- `precision-50pct-diff` matched `precision-1px-diff` post-Phase-3 (both run
+  the full byte loop, dominated by allocation + zero-fill). With those gone,
+  the remaining work is the comparison itself.
+- Pre-existing CGContext quirk surfaced by uninitialized pool memory: the
+  default `.normal` blend mode mixes translucent source pixels with whatever
+  bytes already live in the destination buffer. Fixed by setting `.copy`
+  blend mode in `context(for:)`. Byte-equivalent on the pre-existing
+  zero-initialized legacy path.
+- Peak RSS regression on `exact-match-mixed` is the explicit trade-off:
+  default pool size of `clamp(activeProcessorCount * 2, 2, 32)` retains up
+  to ~16 buffers process-wide, each grown to fit the largest image seen.
+  Still ~27% below the original (pre-Phase-1) baseline of 8.54 GB at
+  parallel-8. Projects with tight RSS budgets can lower
+  `SNAPSHOT_TESTING_BUFFER_POOL_SIZE` or set it to `0` to disable.
+- `ImageNormalizationEdgeCasesTests` (12 tests covering Display P3,
+  grayscale, non-premultiplied alpha) and the full XCTest suite (99 tests)
+  pass under both the new path and `SNAPSHOT_TESTING_LEGACY_NORMALIZATION=1`.
 
 ---
 
