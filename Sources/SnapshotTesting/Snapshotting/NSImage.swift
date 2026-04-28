@@ -94,15 +94,18 @@
 
     let pixelCount = oldCgImage.width * oldCgImage.height
     let byteCount = imageContextBytesPerPixel * pixelCount
-    let pool = SnapshotTestingByteBufferPool.shared
-    let oldSlot = pool.acquire(byteCount: byteCount)
-    defer { pool.release(oldSlot) }
-    guard let oldData = context(for: oldCgImage, data: oldSlot.buffer)?.data else {
+    // Raw allocation (vs `[UInt8](repeating: 0, ...)`) skips the per-call
+    // zero-fill, which dominated wall time on the byte-loop scenarios. Safe
+    // because `context(for:)` uses `.copy` blend mode and overwrites every
+    // destination byte on draw.
+    let oldBuffer = UnsafeMutableRawPointer.allocate(byteCount: byteCount, alignment: 16)
+    defer { oldBuffer.deallocate() }
+    guard let oldData = context(for: oldCgImage, data: oldBuffer)?.data else {
       return "Reference image's data could not be loaded."
     }
-    let newSlot = pool.acquire(byteCount: byteCount)
-    defer { pool.release(newSlot) }
-    guard let newData = context(for: newCgImage, data: newSlot.buffer)?.data else {
+    let newBuffer = UnsafeMutableRawPointer.allocate(byteCount: byteCount, alignment: 16)
+    defer { newBuffer.deallocate() }
+    guard let newData = context(for: newCgImage, data: newBuffer)?.data else {
       return "Newly-taken snapshot's data could not be loaded."
     }
     if memcmp(oldData, newData, byteCount) == 0 { return nil }
@@ -121,8 +124,8 @@
     } else {
       let byteCountThreshold = Int((1 - precision) * Float(byteCount))
       var differentByteCount = 0
-      let oldPtr = oldSlot.buffer.assumingMemoryBound(to: UInt8.self)
-      let newPtr = newSlot.buffer.assumingMemoryBound(to: UInt8.self)
+      let oldPtr = oldBuffer.assumingMemoryBound(to: UInt8.self)
+      let newPtr = newBuffer.assumingMemoryBound(to: UInt8.self)
       var index = 0
       while index < byteCount {
         if oldPtr[index] != newPtr[index] {

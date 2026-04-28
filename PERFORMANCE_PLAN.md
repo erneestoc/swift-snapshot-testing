@@ -26,15 +26,22 @@
     `"Actual image precision X is less than required Y"` error wording
     (Phase 1 had truncated it for the early-exit). Removed the early-exit;
     `precision-early-fail` regresses ~22ms → ~30ms in exchange for honest reporting.
-- **Phase 5** ✅ code `c6b7d9e`. `SnapshotTestingByteBufferPool` (LIFO,
-  size-bounded, `SNAPSHOT_TESTING_BUFFER_POOL_SIZE` / `_MAX_BYTES`).
-  Required pinning `context(for:)` to `.copy` blend mode so the uninitialized
-  pool memory doesn't blend with translucent source pixels — caught by
+- **Phase 5** ✅ landed. Replaced `[UInt8](repeating: 0, count:)` with
+  `UnsafeMutableRawPointer.allocate(byteCount:alignment:16)` +
+  `defer { deallocate() }` in both `compare()` paths and
+  `normalizedComponentDiff`. Required pinning `context(for:)` to `.copy`
+  blend mode so uninitialized destination memory isn't blended with
+  translucent source pixels — caught by
   `ImageNormalizationEdgeCasesTests.testNonPremultipliedAlpha_identicalImagesPass`.
-  Headline: serial `precision-1px-diff` p50 −29%, parallel-4 wall −31%;
-  `exact-match-large` serial p50 −33%. Trade-off: peak RSS on
-  `exact-match-mixed` rises (pool retains hot buffers) but stays well below
-  the original baseline.
+  Headline: serial `precision-1px-diff` p50 **−29%**, parallel-4 wall
+  **−33%**; serial `exact-match-large` p50 **−33%**; peak RSS at parallel-8
+  also drops slightly vs Phase 4 (~−4%). The wins come from skipping the
+  per-call zero-fill (≈400 µs for a 4 MB buffer at ~10 GB/s memset).
+  - First attempt (commit `c6b7d9e`) introduced a `SnapshotTestingByteBufferPool`
+    enabled by default at `2 × activeProcessorCount` slots. Wall-time wins
+    held but peak RSS *grew* +33% as 16 hot buffers were retained
+    process-wide — the opposite of the phase's goal. Reverted to raw
+    allocation; the pool wasn't pulling weight beyond the zero-fill skip.
 - **Phase 6** pending — fast-path `context(for:)` for already-normalized images.
   Highest remaining wall-time impact; depends on Phase 5.
 
@@ -300,109 +307,117 @@ Notes:
 
 ---
 
-## Phase 5 — Normalized buffer pool (low risk / high impact)
+## Phase 5 — Skip per-call zero-fill on the normalized RGBA buffers
 
 Each `compare()` call allocates two `[UInt8]` buffers sized
-`width * height * 4` for the normalized RGBA renderings. At parallel-8 on
-4096×4096 images this is ~8 × 2 × 64MB ≈ 1GB of transient `[UInt8]` per
-window — visible in the peak RSS climb across phases (5.0GB at parallel-8 in
-Phase 3). A small parallelism-sized pool of reusable buffers, returned after
-each `compare()`, keeps peak RSS flat under load with zero semantic change.
+`width * height * 4` for the normalized RGBA renderings. At a 4096×4096 image
+that's ~64MB per buffer; the cost we discovered profiling Phase 4 is the
+*per-call zero-fill* on those allocations, not the allocation itself —
+`[UInt8](repeating: 0, count: byteCount)` issues a `memset` that runs at the
+RAM bandwidth ceiling (~10 GB/s), which is ≈400 µs for one 4MB normalized
+buffer and dominates wall time on the byte-loop scenarios.
+
+The fix is mechanical: replace the Swift-array allocation with
+`UnsafeMutableRawPointer.allocate(byteCount:alignment:16)` +
+`defer { deallocate() }`. The raw allocator skips the zero-fill; safety
+relies on `context(for:)` overwriting every destination byte during draw,
+which requires pinning the blend mode to `.copy` (otherwise the default
+`.normal` mode would blend translucent source pixels with the uninitialized
+destination — caught by `testNonPremultipliedAlpha_identicalImagesPass`).
 
 ### Changes
 
-1. **`SnapshotTestingByteBufferPool`** in
-   `Sources/SnapshotTesting/Snapshotting/Internal/ImageComparisonResources.swift`.
-   - Pool of `(buffer: UnsafeMutableRawPointer, capacity: Int)` slots.
-   - `acquire(byteCount:) -> Slot` — returns a slot with `capacity >= byteCount`,
-     either reused from the pool or freshly allocated; resizes if the smallest
-     pooled slot is too small.
-   - `release(_ slot: Slot)` — returns the slot for reuse (LIFO so hot buffers
-     stay hot in cache).
-   - Bounded size from `SNAPSHOT_TESTING_BUFFER_POOL_SIZE` (default = clamp of
-     `ProcessInfo.activeProcessorCount * 2` to `[2, 32]`); set to `0` to
-     disable (always fresh allocation).
-   - `@unchecked Sendable`, lock-protected.
-2. **`compare()` rewrites** in both `UIImage.swift` and `NSImage.swift`:
-   - Replace `var oldBytes = [UInt8](repeating: 0, count: byteCount)` with
-     `let oldSlot = pool.acquire(byteCount: byteCount); defer { pool.release(oldSlot) }`.
-   - Pass `oldSlot.buffer` to `context(for:data:)` (already accepts
+1. **`Sources/SnapshotTesting/Snapshotting/UIImage.swift`** and
+   **`Sources/SnapshotTesting/Snapshotting/NSImage.swift`** — `compare()`:
+   - Replace `var oldBytes = [UInt8](repeating: 0, count: byteCount)` (and
+     the matching `newBytes`) with
+     `let oldBuffer = UnsafeMutableRawPointer.allocate(byteCount: byteCount, alignment: 16)`
+     and `defer { oldBuffer.deallocate() }`.
+   - Pass `oldBuffer` directly to `context(for:data:)` (already accepts
      `UnsafeMutableRawPointer?`).
-   - Same for `newBytes`. The precision loop indexes through
-     `oldSlot.buffer.assumingMemoryBound(to: UInt8.self)` (an
-     `UnsafeMutableBufferPointer<UInt8>` of length `byteCount`).
-3. **`normalizedComponentDiff`** also acquires its two normalization buffers
-   from the pool; the `[UInt8]` for `diffBytes` stays Swift-allocated since
-   `vImage_Buffer` and `createCGImage` need a live Swift backing for the
-   produced `CGImage`. (Or: also pool diffBytes if vImage `Buffer_Init` from
-   raw pointer is used. Decide during implementation.)
-4. Document env var in `README.md`.
+   - The precision loop iterates through
+     `oldBuffer.assumingMemoryBound(to: UInt8.self)`.
+2. **`normalizedComponentDiff`** in `UIImage.swift` — same raw-allocation
+   swap for its two normalization buffers. (`diffBytes` keeps its `[UInt8]`
+   backing because vImage / `createCGImage` need a live Swift owner for the
+   produced `CGImage`.)
+3. **`context(for:)`** in both files — set
+   `context.setBlendMode(.copy)` before `context.draw(...)`. `.copy`
+   replaces destination pixels outright; on the legacy zero-initialized
+   path this is byte-equivalent to `.normal` (only translucent-pixel
+   blending changes, and there's no destination to blend against in a
+   zero buffer).
+4. **`legacyCompare`** stays untouched on `[UInt8]` — the
+   `SNAPSHOT_TESTING_LEGACY_NORMALIZATION=1` escape hatch keeps the
+   pre-Phase-3 path bit-identical for one release.
 
 ### Verification
 
-- Bench `--parallel 8` shows flatter / lower peak RSS than Phase 4 across all
-  scenarios; `total_alloc` (if we add the counter) should drop sharply.
-- Wall time should be ≤ Phase 4 (maybe slightly better from cache reuse,
-  certainly not worse).
-- Existing snapshot suite + edge-case tests stay green.
-- New unit tests: pool returns correct-size buffers; pool reuses (same pointer
-  returned after release/acquire); pool grows on contention; `release` is
-  idempotent against double-call; env override works; setting to `0` disables.
+- Full XCTest suite (99 tests) passes under both code paths.
+- `ImageNormalizationEdgeCasesTests` (12 tests covering Display P3,
+  grayscale, non-premultiplied alpha) green — including the new
+  `testNonPremultipliedAlpha_identicalImagesPass` that catches blend-mode
+  regressions.
+- Bench harness shows wall-time wins on the byte-loop scenarios with peak
+  RSS unchanged or slightly lower than Phase 4 (no buffers retained
+  process-wide).
 
 ### Risks
 
-- Pointer aliasing: a buffer must not be returned while still in use. The
-  `defer { release }` discipline + Swift's strict-mode borrow checking makes
-  this safe in practice, but the unit tests should include a stress harness
-  that fires `concurrentPerform` and verifies no two acquires share a slot.
-- Buffer-size growth: an outlier 16K×16K image followed by 100 small images
-  would keep a 1GB slot pinned. Mitigation: bound `slot.capacity` to
-  `SNAPSHOT_TESTING_BUFFER_POOL_MAX_BYTES` (default 256MB, i.e. 8K×8K RGBA);
-  oversize requests bypass the pool and free immediately.
+- Uninitialized destination memory leaking into compares if `context(for:)`
+  ever stops fully overwriting. Mitigated by the `.copy` blend mode +
+  `ImageNormalizationEdgeCasesTests` regression coverage.
+
+### What we tried first (and reverted)
+
+Initial attempt (commit `c6b7d9e`) wrapped the raw allocation in a process-
+wide LIFO `SnapshotTestingByteBufferPool` enabled by default at
+`2 × activeProcessorCount` slots, with env knobs
+(`SNAPSHOT_TESTING_BUFFER_POOL_SIZE` / `_MAX_BYTES`). Wall-time wins held,
+but **peak RSS grew +33%** at parallel-8 on `exact-match-mixed` because ~16
+buffers stayed pinned process-wide, each grown to fit the largest image
+seen. That's the opposite of the phase's stated goal (lowering RSS), and
+the wins came from the zero-fill skip, not from allocator reuse — so the
+pool was reverted entirely. Final code keeps the raw allocation but frees
+on `defer`.
 
 ### Results
 
-Code: `c6b7d9e` · Bench: tracked under `bench-results/c6b7d9e-*.csv`
-(vs `bench-results/a3c01cd-*.csv`).
+Code: `ea4df68` (post-revert) · Bench: `bench-results/ea4df68-*.csv`
+vs `bench-results/a3c01cd-*.csv`.
 
 | Metric | Phase 4 | Phase 5 | Δ vs Phase 4 |
 |---|---|---|---|
-| `exact-match-large` p50, serial | 4.53 ms | 3.02 ms | **−33%** |
-| `exact-match-large` wall, parallel-4 | 323 ms | 271 ms | −16% |
-| `exact-match-mixed` p50, serial | 1.46 ms | 1.31 ms | −11% |
-| `exact-match-mixed` wall, parallel-8 | 1277 ms | 1165 ms | −9% |
-| `exact-match-small` p50, serial | 13.8 µs | 10.5 µs | −24% |
-| `precision-1px-diff` p50, serial | 1.75 ms | 1.25 ms | **−29%** |
-| `precision-1px-diff` wall, parallel-4 | 173 ms | 120 ms | **−31%** |
-| `precision-50pct-diff` p50, serial | 1.96 ms | 1.27 ms | **−35%** |
-| `precision-50pct-diff` wall, parallel-4 | 166 ms | 136 ms | −18% |
-| `precision-early-fail` p50, serial | 23.58 ms | 24.28 ms | +3% (noise) |
-| `perceptual-pass` p50, serial | 6.07 ms | 6.16 ms | +1% (noise) |
-| `perceptual-fail` p50, serial | 6.03 ms | 6.23 ms | +3% (noise) |
-| Peak RSS, parallel-4 (exact-match-mixed) | 4.75 GB | 6.37 GB | +34% |
-| Peak RSS, parallel-8 (exact-match-mixed) | 4.65 GB | 6.21 GB | +33% |
+| `exact-match-large` p50, serial | 4.53 ms | 3.03 ms | **−33%** |
+| `exact-match-large` wall, parallel-4 | 323 ms | 264 ms | −18% |
+| `exact-match-mixed` p50, serial | 1.46 ms | 1.26 ms | −14% |
+| `exact-match-mixed` wall, parallel-4 | 1966 ms | 1209 ms | **−38%** |
+| `exact-match-mixed` wall, parallel-8 | 1277 ms | 1038 ms | −19% |
+| `exact-match-small` p50, serial | 13.8 µs | 10.8 µs | −22% |
+| `precision-1px-diff` p50, serial | 1.75 ms | 1.24 ms | **−29%** |
+| `precision-1px-diff` wall, parallel-4 | 173 ms | 115 ms | **−33%** |
+| `precision-50pct-diff` p50, serial | 1.96 ms | 1.24 ms | **−37%** |
+| `precision-50pct-diff` wall, parallel-4 | 166 ms | 109 ms | **−34%** |
+| `precision-early-fail` p50, serial | 23.58 ms | 24.66 ms | +5% (noise) |
+| `perceptual-pass` p50, serial | 6.07 ms | 5.98 ms | −1% |
+| `perceptual-fail` p50, serial | 6.03 ms | 5.86 ms | −3% |
+| Peak RSS, parallel-4 (exact-match-mixed) | 4.75 GB | 4.53 GB | **−5%** |
+| Peak RSS, parallel-8 (exact-match-mixed) | 4.65 GB | 4.48 GB | **−4%** |
 
 Notes:
-- Wall-time wins are dominated by skipping the `[UInt8](repeating: 0, count:)`
-  zero-fill on every call. The pool both avoids the allocation *and* avoids
-  the memset; the latter is the bigger cut for the precision scenarios.
-- `precision-50pct-diff` matched `precision-1px-diff` post-Phase-3 (both run
-  the full byte loop, dominated by allocation + zero-fill). With those gone,
-  the remaining work is the comparison itself.
-- Pre-existing CGContext quirk surfaced by uninitialized pool memory: the
-  default `.normal` blend mode mixes translucent source pixels with whatever
-  bytes already live in the destination buffer. Fixed by setting `.copy`
-  blend mode in `context(for:)`. Byte-equivalent on the pre-existing
-  zero-initialized legacy path.
-- Peak RSS regression on `exact-match-mixed` is the explicit trade-off:
-  default pool size of `clamp(activeProcessorCount * 2, 2, 32)` retains up
-  to ~16 buffers process-wide, each grown to fit the largest image seen.
-  Still ~27% below the original (pre-Phase-1) baseline of 8.54 GB at
-  parallel-8. Projects with tight RSS budgets can lower
-  `SNAPSHOT_TESTING_BUFFER_POOL_SIZE` or set it to `0` to disable.
-- `ImageNormalizationEdgeCasesTests` (12 tests covering Display P3,
-  grayscale, non-premultiplied alpha) and the full XCTest suite (99 tests)
-  pass under both the new path and `SNAPSHOT_TESTING_LEGACY_NORMALIZATION=1`.
+- Wall-time wins are entirely the avoided zero-fill: at ~10 GB/s memset,
+  one 4 MB normalized buffer takes ~400 µs, two of them ~800 µs — which is
+  the exact cut visible on `precision-1px-diff` (1.75 → 1.24 ms).
+- `precision-50pct-diff` matched `precision-1px-diff` post-Phase-3 (both
+  run the full byte loop, dominated by allocation + zero-fill). With the
+  zero-fill gone, the remaining work is the comparison itself.
+- Peak RSS dips slightly because the raw allocator hands back pages as
+  soon as `defer` fires, where Swift's array buffer keeps the backing
+  store alive for the lifetime of the local. No buffers are retained
+  process-wide.
+- `.copy` blend mode in `context(for:)` is byte-equivalent to `.normal`
+  on the pre-existing zero-initialized legacy path; both edge-case tests
+  and `SNAPSHOT_TESTING_LEGACY_NORMALIZATION=1` confirm.
 
 ---
 
