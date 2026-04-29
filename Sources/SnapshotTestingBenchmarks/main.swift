@@ -1,11 +1,18 @@
 import Foundation
 
 #if canImport(AppKit) || canImport(UIKit)
+enum BenchSuite: String {
+  case `default`
+  case ios
+  case all
+}
+
 struct CLIOptions {
   var parallelism: Int = 1
   var outputPath: String? = nil
   var only: Set<String> = []
   var iterationsScale: Double = 1.0
+  var suite: BenchSuite = .default
 }
 
 func parseArgs(_ args: [String]) -> CLIOptions {
@@ -30,15 +37,25 @@ func parseArgs(_ args: [String]) -> CLIOptions {
     case "--scale":
       i += 1
       if i < args.count, let s = Double(args[i]) { opts.iterationsScale = max(0.01, s) }
+    case "--suite":
+      i += 1
+      if i < args.count, let s = BenchSuite(rawValue: args[i]) {
+        opts.suite = s
+      } else {
+        FileHandle.standardError.write(Data("invalid --suite value (expected: default, ios, all)\n".utf8))
+        exit(2)
+      }
     case "--help", "-h":
       print("""
-        snapshot-bench [--serial | --parallel N] [--out PATH] [--only NAME[,NAME...]] [--scale F]
+        snapshot-bench [--serial | --parallel N] [--out PATH] [--only NAME[,NAME...]] [--scale F] [--suite NAME]
 
         --serial          Run scenarios on a single thread (default).
         --parallel N      Run each scenario's iterations on N concurrent workers.
         --out PATH        Write results CSV to PATH. Defaults to stdout.
         --only NAMES      Run only scenarios whose names match one of NAMES (comma-separated).
         --scale F         Multiply iteration counts by F (e.g. 0.1 for a smoke run).
+        --suite NAME      Scenario suite: default (current scenarios), ios (iOS-resolution suite),
+                          or all (both). Default: default.
         """)
       exit(0)
     default:
@@ -66,7 +83,7 @@ struct ScaledScenario: Scenario {
 
 let opts = parseArgs(CommandLine.arguments)
 
-let allScenarios: [Scenario] = [
+let defaultScenarios: [Scenario] = [
   ExactMatchSmall(),
   ExactMatchLarge(),
   ExactMatchMixed(),
@@ -77,6 +94,26 @@ let allScenarios: [Scenario] = [
   PerceptualFail(),
   PNGRoundTrip(),
 ]
+
+func makeIOSScenarios() -> [Scenario] {
+  return [
+    IPhoneExactMatch(),
+    IPhone1pxDiff(),
+    IPhonePrecision99(),
+    IPadExactMatch(),
+    IPad1pxDiff(),
+    IPadPrecision99(),
+    IPhonePerceptualPass(),
+  ]
+}
+
+let allScenarios: [Scenario] = {
+  switch opts.suite {
+  case .default: return defaultScenarios
+  case .ios: return makeIOSScenarios()
+  case .all: return defaultScenarios + makeIOSScenarios()
+  }
+}()
 
 let filtered: [Scenario] = opts.only.isEmpty
   ? allScenarios

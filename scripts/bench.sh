@@ -7,6 +7,7 @@
 #   scripts/bench.sh                       # full sweep (serial + parallel-4 + parallel-8)
 #   scripts/bench.sh --quick               # smoke run with --scale 0.1
 #   scripts/bench.sh --only NAME[,NAME...] # restrict to specific scenarios
+#   scripts/bench.sh --suite ios|all       # opt-in iOS-resolution suite
 #   BENCH_OUT_DIR=/tmp/x scripts/bench.sh  # override output dir
 #
 # Exit non-zero if any mode fails.
@@ -17,6 +18,7 @@ cd "$(dirname "$0")/.."
 
 EXTRA_ARGS=()
 QUICK=0
+SUITE="default"
 while [[ $# -gt 0 ]]; do
   case "$1" in
     --quick)
@@ -28,8 +30,14 @@ while [[ $# -gt 0 ]]; do
       EXTRA_ARGS+=(--only "$1")
       shift
       ;;
+    --suite)
+      shift
+      SUITE="$1"
+      EXTRA_ARGS+=(--suite "$1")
+      shift
+      ;;
     -h|--help)
-      sed -n '2,12p' "$0"
+      sed -n '2,13p' "$0"
       exit 0
       ;;
     *)
@@ -63,10 +71,17 @@ PLATFORM_DIR="$(xcrun --show-sdk-platform-path)"
 export DYLD_FRAMEWORK_PATH="$PLATFORM_DIR/Developer/Library/Frameworks:$PLATFORM_DIR/Developer/Library/PrivateFrameworks${DYLD_FRAMEWORK_PATH:+:$DYLD_FRAMEWORK_PATH}"
 export DYLD_LIBRARY_PATH="$PLATFORM_DIR/Developer/usr/lib${DYLD_LIBRARY_PATH:+:$DYLD_LIBRARY_PATH}"
 
+SUITE_TAG=""
+if [[ "$SUITE" == "ios" ]]; then
+  SUITE_TAG="-ios"
+elif [[ "$SUITE" == "all" ]]; then
+  SUITE_TAG="-all"
+fi
+
 run_mode() {
   local mode="$1"
   shift
-  local out="$OUT_DIR/${GIT_SHA}${DIRTY}-${mode}.csv"
+  local out="$OUT_DIR/${GIT_SHA}${DIRTY}${SUITE_TAG}-${mode}.csv"
   echo "==> mode=$mode -> $out"
   "$BIN" "$@" "${EXTRA_ARGS[@]}" --out "$out"
 }

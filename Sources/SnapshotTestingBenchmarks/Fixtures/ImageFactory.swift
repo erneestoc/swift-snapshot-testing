@@ -147,6 +147,30 @@ enum ImageFactory {
     }
   }
 
+  // iPhone 15 Pro logical resolution — RGBA buffer ≈ 12 MB.
+  static func iphoneScreenshot() -> BenchImage {
+    return gradient(width: 1179, height: 2556)
+  }
+
+  // iPad Pro 13" logical resolution — RGBA buffer ≈ 22 MB.
+  static func ipadScreenshot() -> BenchImage {
+    return gradient(width: 2064, height: 2752)
+  }
+
+  static func iphoneScreenshotWithDiff(at pixelIndex: Int = 0) -> BenchImage {
+    return mutating(iphoneScreenshot()) { bytes in
+      let offset = max(0, pixelIndex * 4) % bytes.count
+      bytes[offset] = bytes[offset] &+ 1
+    }
+  }
+
+  static func ipadScreenshotWithDiff(at pixelIndex: Int = 0) -> BenchImage {
+    return mutating(ipadScreenshot()) { bytes in
+      let offset = max(0, pixelIndex * 4) % bytes.count
+      bytes[offset] = bytes[offset] &+ 1
+    }
+  }
+
   static func nearlyIdentical(_ base: BenchImage, delta: UInt8 = 1) -> BenchImage {
     return mutating(base) { bytes in
       var i = 0
