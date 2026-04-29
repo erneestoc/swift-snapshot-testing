@@ -1051,26 +1051,25 @@ Per-stage timings, serial p50 (ns columns formatted as ms):
 
 #### What this means for a Phase 10
 
-The data argues for one of two compare-side optimizations:
+The data argues for one compare-side optimization:
 
-- **Cache the normalized buffer for the reference image.** The
-  reference NSImage is constructed once per scenario but normalized
-  every iteration. A reference-side cache (keyed by the CGImage
-  pointer) would amortize the ~40 ms cost across iterations. In real
-  test suites the reference is also re-read from disk each
-  assertion, so the cache would need a content-hash key, not a
-  pointer key. Risk: cache invalidation when the reference file
-  changes between asserts in a single suite (uncommon but possible).
 - **Detect the canonical-layout fast path at runtime.** When both
   CGImages already have RGBA8 + sRGB + premultipliedLast + tight row
-  stride, skip the `context(for:)` redraw and use the existing
+  stride, skip the `context(for:)` redraw and `memcmp` the existing
   CGImage data directly. The synthetic Phase 6 numbers prove this
   path is ~85× cheaper when applicable; the pipeline data shows the
-  current code never takes it.
+  current code never takes it on PNG-decoded references.
 
-Both are out of scope for Phase 9 (which is bench-only) and would be
-their own phase. No commitment to ship either yet — the data is the
-Phase 9 deliverable, the optimization is the Phase 10 question.
+A reference-side normalization cache was considered and **rejected** —
+in real test suites each `assertSnapshot` call uses a unique reference
+PNG once per run, so amortizing the normalize cost across repeated
+calls to the same reference only helps inside the bench (artificial
+repetition), not in real suites. The fast-path detection helps every
+assertion regardless of whether its reference recurs.
+
+Out of scope for Phase 9 (bench-only) and would be its own phase. The
+data is the Phase 9 deliverable; the optimization is the Phase 10
+question.
 
 ---
 
