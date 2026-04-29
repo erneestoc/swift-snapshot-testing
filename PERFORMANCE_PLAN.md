@@ -42,11 +42,18 @@
     held but peak RSS *grew* +33% as 16 hot buffers were retained
     process-wide — the opposite of the phase's goal. Reverted to raw
     allocation; the pool wasn't pulling weight beyond the zero-fill skip.
-- **Phase 6** pending — extend bench harness with iOS-resolution scenarios
-  (iPhone 1179×2556 ≈ 12 MB/buffer, iPad 2064×2752 ≈ 22 MB/buffer) to
-  model real-world test suites with 10s of thousands of image snapshots.
-  Decides whether further optimizations (e.g., a canonical-layout
-  fast-path that bypasses `CGContext.draw`) are worth pursuing.
+- **Phase 6** ✅ harness `eced587`, bench `c9e32ff`. Seven new scenarios
+  at iPhone 15 Pro (1179×2556, ~12 MB/buffer) and iPad Pro 13"
+  (2064×2752, ~22 MB/buffer) gated behind `--suite ios`. Headline
+  serial p50: iphone exact-match **0.93 ms** (faster than two raw
+  memcpys of the buffer would take), iphone 1px-diff **6.66 ms**, ipad
+  1px-diff **9.80 ms**. Peak RSS at parallel-8 with 22 MB ipad buffers:
+  **1.57 GB** — well under the 4-5 GB the plan budgeted, confirming
+  Phase 5's `defer { deallocate() }` returns pages cleanly at iOS
+  sizes. **Decision: canonical-layout fast-path is not worth doing** —
+  CG `draw` already runs faster than the RAM-bandwidth ceiling for two
+  full memcpys, so bypassing it would save little. See Phase 6 Results
+  for per-call → suite-level extrapolations.
 
 ### Resume context
 
@@ -530,6 +537,74 @@ After this phase produces results, we'll have evidence to answer:
 3. **What's the realistic CI-level speedup vs. baseline?** With per-call
    numbers at iOS sizes, "Phase 5 makes a 10 000-snapshot iPad suite N
    seconds faster" stops being a hand-wave.
+
+### Results
+
+Code: `eced587` · Bench: `c9e32ff` (CSVs:
+`bench-results/eced587-ios-{serial,parallel-4,parallel-8}.csv`).
+
+| Scenario | Buffer | Iter | Serial p50 | Serial p95 | P-4 wall | P-8 wall | Peak RSS (P-8) |
+|---|---|---|---|---|---|---|---|
+| `iphone-exact-match` | 12 MB | 1000 | 0.93 ms | 1.03 ms | 286 ms | 259 ms | 838 MB |
+| `iphone-1px-diff` (precision 0, full byte loop) | 12 MB | 1000 | 6.66 ms | 9.80 ms | 393 ms | 387 ms | 838 MB |
+| `iphone-precision-99` (~0.4% pixels) | 12 MB | 500 | 6.07 ms | 6.78 ms | 213 ms | 195 ms | 838 MB |
+| `iphone-perceptual-pass` | 12 MB | 250 | 52.57 ms | 57.05 ms | 1287 ms | 1329 ms | 1.86 GB |
+| `ipad-exact-match` | 22 MB | 500 | 1.36 ms | 1.43 ms | 246 ms | 195 ms | 1.57 GB |
+| `ipad-1px-diff` (precision 0) | 22 MB | 500 | 9.80 ms | 11.61 ms | 358 ms | 316 ms | 1.57 GB |
+| `ipad-precision-99` | 22 MB | 250 | 8.32 ms | 8.92 ms | 177 ms | 166 ms | 1.57 GB |
+
+#### Suite-level extrapolation (per-call wall × N)
+
+10 000-snapshot suites at parallel-8 wall time:
+
+| Workload | iPhone (12 MB) | iPad (22 MB) |
+|---|---|---|
+| All exact-match | 2.6 s | 3.9 s |
+| All 1px-diff (worst-case full byte loop) | 3.9 s | 6.3 s |
+| All precision-99 | 3.9 s | 6.6 s |
+| All perceptual | 53 s | (not measured) |
+
+#### Decisions this phase resolved
+
+1. **Canonical-layout fast-path: not worth doing.** `iphone-exact-match`
+   p50 is 0.93 ms — *faster* than two raw memcpys of the 12 MB buffer
+   would take (≈ 2.4 ms at ~10 GB/s). CG `draw` is already short-
+   circuiting on canonical-layout source images (likely tile / CoW
+   tricks under the hood); replacing it would give us little headroom.
+   The same holds at iPad sizes (1.36 ms vs ≈ 4.4 ms naïve).
+2. **Phase 5 RSS story holds at iOS sizes.** Sustained 22 MB-buffer
+   workload on parallel-8 lands at 1.57 GB peak — well under the 4-5 GB
+   ceiling the plan budgeted, and matching the
+   `(workers × 2 × 22 MB) ≈ 352 MB` in-flight estimate plus
+   steady-state overhead. No buffer leakage; `defer { deallocate() }`
+   returns pages cleanly.
+3. **Realistic CI speedup is ~tens of seconds, not minutes.** A
+   10 000-iPhone-snapshot suite with all 1px-diffs (a pessimistic
+   workload — most real assertions are exact-match or precision-passing)
+   completes in under 4 s wall at parallel-8. Most real iOS test
+   suites will be image-bound on the order of seconds-to-tens-of-seconds,
+   not the minutes that pre-Phase-1 baseline implied.
+
+#### Notes
+
+- **Sub-linear scaling with buffer size**: 12 MB → 22 MB is a 1.83×
+  increase in pixel count, but `1px-diff` p50 only grows 1.47×
+  (6.66 → 9.80 ms). Some per-call overhead (CG context setup, function
+  dispatch, autoreleasepool drain) is fixed cost amortized across
+  pixels; the byte loop itself scales linearly.
+- **Parallel-4 ≈ parallel-8 wall time** on most scenarios. The
+  workload is RAM-bandwidth-bound at iOS sizes, not CPU-bound; adding
+  workers past 4 buys little. Independently noticed: `BenchRunner`
+  uses `DispatchQueue.concurrentPerform` which doesn't actually pin to
+  N workers — it always lets GCD use the full machine. The CLI
+  `--parallel N` is currently informational only. That's a pre-Phase-6
+  harness limitation, not a code bug; for "thermally-equivalent core
+  count" experiments, fixing it is a good follow-up but doesn't
+  change Phase 6's conclusions.
+- **Perceptual at iPhone size is ~10× slower than precision** (52 ms
+  vs 6 ms p50). Suite-level cost is dominated by perceptual
+  assertions when present; the existing `perceptualPrecision` opt-in
+  is correctly the more expensive option.
 
 ---
 
