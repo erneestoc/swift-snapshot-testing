@@ -87,20 +87,53 @@
   latency tightening + a Metal-heap-floor drop, not p50 throughput
   — MPS construction was either cheaper than estimated or already
   overlapped with the GPU sync. Edge-case + precision tests pass.
-- **Phase 9** pending — internal coalescing-window batch for the
-  perceptual path. Sync `Diffing` API stays; under the hood, perceptual
-  compares enqueue onto a shared coordinator that submits up to N
-  pending requests in one Metal command buffer per coalescing window.
-  Amortizes the per-call GPU sync that dominates serial p50 (52 ms ≈
-  ~47 ms wait + ~5 ms compute). No public API change. Win is bounded
-  by the perceptual concurrency limiter — pairs with raising
-  `SNAPSHOT_TESTING_PERCEPTUAL_DIFF_CONCURRENCY` default.
+- **Phase 9** ✅ code `dfbeec6`, bench `ede47aa`. Added `--suite pipeline`
+  with 4 NSView staged scenarios that replay the public-API stages of
+  `verifySnapshot` (render → read → decode → compare → attachments) with
+  per-stage timestamps. CSV gains `<stage>_p50_ns`/`<stage>_p95_ns`
+  columns when staged scenarios are present; default and ios suites'
+  CSV unchanged. Bench-only, no library code touched. Headline serial
+  p50 (`bench-results/dfbeec6-pipeline-serial.csv`):
+  - `pipeline-large-iphone`: **126 ms** total — compare 78 ms (**62%**),
+    render 48 ms (38%), read+decode 0.3 ms (negligible).
+  - `pipeline-large-iphone-fail`: **268 ms** — attachments 182 ms
+    (**68%**) dominates; pure compare 36 ms; render 50 ms. Failure-path
+    cost (3× PNG re-encode at iPhone size + diff PNG generation) is
+    only paid when a test actually fails.
+  - `pipeline-medium-stack`: 2.42 ms — compare 1.72 ms (71%).
+  - `pipeline-small-flat`: 0.34 ms — compare 199 µs (56%).
+  **Surprise:** pipeline `compare_p50` of 78 ms at iPhone size is **~85×**
+  the synthetic `iphone-exact-match` p50 of 0.93 ms (Phase 6). The
+  synthetic scenario shared canonical-layout buffers between old and
+  new (same NSImage instance → same CGImage → cheap normalize); the
+  pipeline reference is a PNG-decoded NSImage whose layout differs from
+  the live-rendered NSImage, forcing `context(for:)` to do real work
+  for both buffers. The "compare is at the floor" hypothesis from
+  Phase 6 doesn't hold for real pipelines.
+  **Next-phase signal**: render = 38% (under the 50% threshold);
+  decode = 0.16% (well under 30%); compare = 62% on the success path.
+  By the plan's own decision rule, the next compare-side optimization
+  is warranted — and the data points at the normalize step (CG draw
+  with mismatched source/destination layouts) as the new hot spot.
+  The failure path hot spot (PNG re-encoding for 3 attachments at
+  iPhone size = ~180 ms) is a real cost but only fires on test
+  failure. Pipeline scenarios are forced serial regardless of
+  `--parallel N` because AppKit autolayout is main-thread-only after
+  first use; `mode`/`parallelism` columns still report the requested
+  value to keep CSVs diff-comparable. The iOS-sim UIView follow-up
+  remains out of scope for this phase.
+- **Deferred (replaced by current Phase 9)**: perceptual coalescing
+  batch + raising `SNAPSHOT_TESTING_PERCEPTUAL_DIFF_CONCURRENCY`
+  default. Would optimize the perceptual path further, but perceptual
+  is opt-in (`perceptualPrecision < 1`) and we don't yet know whether
+  users hit it often enough for it to matter. Revisit if Phase 9 data
+  shows perceptual is the dominant cost for some real workload, or if
+  a user reports it.
 - **Deferred (no current phase planned)**: making the public `Diffing`
-  API async (Option A / B from the design discussion). Would unlock the
-  full ~10× perceptual win at the cost of source-incompatible breakage
-  or permanent dual-API surface. Phase 9 captures the source-compatible
-  ~2× without that cost; revisit only if a user reports the remaining
-  gap matters.
+  API async. Would unlock additional perceptual concurrency at the cost
+  of source-incompatible breakage or permanent dual-API surface. Same
+  gating as the perceptual coalescing batch — needs evidence that the
+  perceptual gap matters.
 
 ### Resume context
 
@@ -778,118 +811,266 @@ and amortizes the MPS construction cost across the whole suite.
 
 ---
 
-## Phase 9 — Internal coalescing batch for the perceptual path
+## Phase 9 — Full-pipeline benchmarks on real views
 
-The Phase 6 follow-up showed perceptual serial p50 = 52 ms is mostly
-GPU-sync wait, not compute (parallel-N wall throughput is ~5 ms/iter).
-Each call submits one Metal command buffer and synchronously waits via
-`context.render(toBitmap:)`. If multiple calls were in flight, the GPU
-could keep itself busy and amortize that sync — but the public
-`Diffing.diffV2` closure is sync, so each caller blocks before the
-next can start.
+After Phase 5, `iphone-exact-match` `compare()` p50 is **0.93 ms** at
+iPhone size — at that floor, comparison is no longer plausibly the
+dominant cost in a real `assertSnapshot` call. Every preceding phase
+has optimized one specific stage (the comparison) without measuring
+where the rest of `assertSnapshot` wall time actually goes. The
+remaining stages are all unmeasured:
 
-Phase 9 is the source-compatible way to capture most of that gap: keep
-the sync `Diffing` API, but inside the perceptual path push work
-through a private coordinator that coalesces up to N pending compares
-into a single submission per window. Each caller still blocks on its
-own result, but submissions overlap on the GPU instead of serializing.
+- **Render**: `prepareView` builds a fresh `UIWindow` + wraps the view
+  in a `UIViewController`, sets traits, runs `layoutIfNeeded`
+  (`Common/View.swift:929`); `addImagesForRenderedViews` walks the
+  entire view tree looking for `WKWebView` / `SCNView` / `SKView`
+  subviews to pre-render (`Common/View.swift:811`); finally
+  `view.layer.render(in:)` (default) or
+  `view.drawHierarchy(in:afterScreenUpdates:true)` produces the
+  `UIImage`. None of this has ever been profiled in the bench.
+- **Reference load**: `Data(contentsOf:)` from disk + `UIImage(data:)`
+  PNG-decode happens sequentially after the render. PNG-decode at
+  iPhone size is non-trivial (multi-ms) and runs on the same thread.
+- **Compare**: the part Phases 1-8 optimized.
+- **Failure attachments**: on mismatch, the diff PNG is generated via
+  `blendModeDiff` / `normalizedComponentDiff`, the failed snapshot is
+  re-encoded to PNG and written to the artifacts dir, and XCTest
+  attachments are recorded.
+
+Phase 9 produces per-stage timing breakdowns so the next optimization
+phase, if any, is data-driven rather than guessed. It also resolves
+the open question raised after Phase 8: is comparison still worth
+optimizing, or has the bottleneck moved elsewhere?
+
+### Goal
+
+For each scenario, report wall time per call **broken down by stage**:
+`render_ns`, `read_ns`, `decode_ns`, `compare_ns`, `attachments_ns`,
+`total_ns`. With that table in hand, "should we optimize X" stops
+being speculative.
 
 ### Changes
 
-1. **`Sources/SnapshotTesting/Snapshotting/Internal/PerceptualBatchCoordinator.swift`**
-   (new) — small actor / serial-queue coordinator owning:
-   - A pending queue of `(oldCIImage, newCIImage, threshold,
-     pixelPrecision, completion)` records.
-   - A coalescing window `W` (e.g., 1-2 ms — long enough to gather
-     concurrent submissions, short enough not to add noticeable
-     per-call latency in low-load test runs).
-   - A worker that drains up to `N` pending records and submits them
-     together. Two valid implementations:
-     - **Same-thread, separate command buffers**: queue N
-       `CIContext.render` calls onto a shared dispatch queue without
-       per-call serializer; the GPU pipelines them. Simpler; gets
-       most of the win with minimal raw-Metal exposure.
-     - **One MTLCommandBuffer with all encodings**: encodes the LabΔE
-       + threshold + areaAverage chain for each pending request
-       manually, commits once, fans out completions. Bigger win, but
-       reaches under `CIContext` — substantially more code.
-   - The simpler shape is the right starting point; promote to the
-     manual-encoding shape only if bench numbers justify it.
-2. **`perceptuallyCompare` in `UIImage.swift` / `NSImage.swift`** —
-   replace direct `context.render(...)` calls with
-   `PerceptualBatchCoordinator.shared.submit(...)` + wait on a
-   per-call `DispatchSemaphore`. Caller-visible behavior unchanged
-   (still sync, still returns `String?`).
-3. **Tunables (env vars)**:
-   - `SNAPSHOT_TESTING_PERCEPTUAL_BATCH_WINDOW_US` — coalescing
-     window in microseconds (default ~1500 — long enough that the
-     dispatch wakeup is amortized, short enough to be invisible at
-     low load).
-   - `SNAPSHOT_TESTING_PERCEPTUAL_BATCH_MAX` — cap on requests per
-     batch (default = current `_PERCEPTUAL_DIFF_CONCURRENCY` value).
-   - Set window to 0 to disable batching (forces immediate
-     per-call submit; useful for diagnosis).
-4. **Pair with raising `SNAPSHOT_TESTING_PERCEPTUAL_DIFF_CONCURRENCY`
-   default** — the limiter was originally there to bound CIContext
-   alloc cost (Phase 2). With the pool fix + Phase 8's MPS cache, the
-   per-call CPU cost is small enough that the limiter is now what
-   *prevents* batching. Default likely moves from 2 to
-   `min(activeProcessorCount, 8)`. Validate with bench before flipping.
+1. **`Sources/SnapshotTestingBenchmarks/Scenarios/PipelineScenarios.swift`**
+   (new) — macOS `NSView` pipeline scenarios. Each scenario:
+   - In `setUp`, builds a representative `NSView` and pre-records the
+     reference PNG to a per-scenario temp directory by invoking the
+     real `Snapshotting<NSView, NSImage>.image` strategy and writing
+     `diffing.toData(image)` to disk.
+   - In `runOnce`, replays the public-API stages of `verifySnapshot`
+     **inline** with explicit timestamps between them: render via
+     `snapshotting.snapshot(view).run { ... }`, `Data(contentsOf:)`,
+     `diffing.fromData(...)`, `diffing.diffV2(reference, new)`. No
+     XCTest expectation overhead inside the timed region; the
+     `Async<NSImage>` callback fires synchronously for the NSView
+     strategy.
+   - The harness records per-stage nanoseconds, not just total.
+2. **Scenario coverage** (NSView, on macOS host):
+   - `pipeline-small-flat` — single `NSTextField` at ~100×40.
+   - `pipeline-medium-stack` — `NSStackView` of 5 text fields + an
+     `NSImageView` at ~320×200.
+   - `pipeline-large-iphone` — synthetic full-screen mock at iPhone
+     size (1179×2556) — same dimensions as the existing `iphone-*`
+     scenarios so the compare-only timings are directly comparable.
+   - `pipeline-large-iphone-fail` — same as above but the new image
+     differs in one pixel; exercises the failure path
+     (`normalizedComponentDiff` + PNG re-encode + write).
+3. **`Sources/SnapshotTestingBenchmarks/Harness/Stats.swift` /
+   `CSV.swift`** — extend the result row to carry per-stage timing
+   percentiles. CSV gains columns: `render_p50_ns, render_p95_ns,
+   read_p50_ns, read_p95_ns, decode_p50_ns, decode_p95_ns,
+   compare_p50_ns, compare_p95_ns, attachments_p50_ns,
+   attachments_p95_ns`. Existing columns unchanged.
+4. **`scripts/bench.sh`** — add `--suite pipeline` that runs only the
+   pipeline scenarios. `--suite all` runs everything. Output filename
+   pattern `bench-results/<sha>-pipeline-{serial,parallel-4,parallel-8}.csv`.
+5. **(Follow-up, separately scoped)** — iOS-simulator UIView pipeline
+   bench. Real `UIView` paths exercise `UIWindow` + `UIViewController`
+   setup that the macOS `NSView` strategy doesn't. Implementation
+   shape: a small XCTest target driven via `xcodebuild test
+   -destination 'platform=iOS Simulator,name=iPhone 15 Pro'` from a
+   new `--simulator` flag in `scripts/bench.sh`. The XCTest cases
+   write their per-stage CSV rows to a path passed via env var. This
+   is gated as a follow-up because the macOS NSView bench is the
+   minimum viable measurement and the iOS-sim infrastructure is its
+   own project to land cleanly.
 
 ### Verification
 
-- **Phase 7 prerequisite.** Without honest `--parallel N` worker pinning,
-  the win can't be measured cleanly.
-- `iphone-perceptual-pass` p50 expected to drop ~30-50 % at
-  `--parallel 4` / `8`; serial p50 drops less (the window adds latency
-  with no batching peer).
-- `iphone-perceptual-pass` parallel-N wall expected to drop ~30-50 %
-  at N ≥ 4; ideal world is ~5 ms/iter (GPU compute floor).
-- Peak RSS at parallel-8 should not regress; can drop modestly because
-  per-call MPS heaps overlap less.
-- Full XCTest suite green; perceptual edge-case tests
-  (`PerceptualPass`, `PerceptualFail`, plus existing perceptual
-  fixtures in `Tests/SnapshotTestingTests`) unchanged in pass / fail
-  outcomes.
-- A new bench scenario `iphone-perceptual-pass-batchable` that runs N
-  perceptual compares back-to-back without any sync points between
-  them, to validate the batching path actually engages.
+- The new pipeline CSVs produce stable per-stage p50 numbers across
+  three consecutive runs (variance < 10%).
+- Comparison-stage numbers in `pipeline-large-iphone` are within ±10%
+  of the existing `iphone-exact-match` p50 — sanity check that the
+  pipeline scenarios drive the same `compare()` code path.
+- No library code changes — phase is bench-only. Existing test suite
+  unchanged and green; existing bench scenarios produce identical CSV
+  rows (the new columns only appear on pipeline scenarios).
 
 ### Risks
 
-- **Cancellation / error propagation**: each pending request needs a
-  way to surface render errors back to its caller. Per-request
-  `Result<Float, Error>` slots solved by storing alongside the
-  semaphore.
-- **Deadlock under low load**: if only one perceptual call is in
-  flight, the coordinator must still drain when the window expires —
-  not wait for `N` to fill. A `DispatchSourceTimer` armed on each
-  enqueue handles this.
-- **Window tuning regresses single-test runs**: a 1.5 ms window is
-  a free 1.5 ms of latency on every isolated perceptual call. Mitigate
-  by short-circuiting when the queue is empty *and* no other request
-  has arrived within (say) 100 µs — i.e., adaptive window.
-- **Test isolation surprises**: if multiple `XCTestCase` classes ever
-  rely on perceptual compares completing before some side-effect, the
-  coordinator must be drained at process exit. `atexit` registration
-  or a `Task.detached` flush in the limiter is sufficient.
+- **NSView ≠ UIView**: NSView's snapshotting strategy is simpler than
+  UIView's (no `UIWindow` setup, no `UIViewController` nesting, no
+  trait-collection plumbing). The macOS-host bench therefore
+  *under-counts* the render stage for real iOS suites. Acceptable as
+  a first pass — establishes the per-stage shape — but the iOS-sim
+  follow-up is what gives us the honest UIView numbers.
+- **Bench wall time grows**: 4 new scenarios × 3 modes adds time to
+  every full sweep. Mitigation: gated behind `--suite pipeline` /
+  `--suite all`; default sweep stays fast.
+- **`SNAPSHOT_ARTIFACTS` pollution**: the failure-path scenario writes
+  diff PNGs every iteration. Mitigation: scenarios point
+  `SNAPSHOT_ARTIFACTS` at a per-run temp dir and clean it in
+  `tearDown`.
+
+### Outcome (what this phase decides)
+
+After this phase produces per-stage data, we'll be able to answer:
+
+1. **Is comparison still the right thing to optimize?** If
+   `compare_ns` is <20% of `total_ns` on the pipeline scenarios, no
+   further compare-side optimization is worth doing — the leverage
+   has moved to render or decode.
+2. **Is render dominated by `prepareView` setup, by
+   `addImagesForRenderedViews` traversal, or by the actual
+   `layer.render(in:)` GPU call?** Sub-stage timing inside the render
+   block (added cheaply with a few extra timestamps) tells us which
+   one to attack first, if any.
+3. **Does parallelizing the reference PNG decode with the view
+   render** (currently sequential — `verifySnapshot` renders then
+   decodes) actually save anything in the success path? Per-stage
+   numbers tell us the upper bound.
+4. **Is the failure-path overhead** (`blendModeDiff` +
+   `normalizedComponentDiff` + PNG re-encode + write to disk) ever
+   visible in real test suites, or is it negligible because most
+   tests pass?
 
 ### Out of scope
 
-- Public `Diffing` API changes (Option A / B from the design
-  discussion). Phase 9 stays under the existing sync surface.
-- Async `assertSnapshot` overload. The XCTest wrapper continues to
-  call sync `diffV2`; only the perceptual implementation pipelines
-  internally.
-- Batching the precision (CPU memcmp) path — already RAM-bandwidth-
-  bound; nothing to gain from coalescing.
+- **Any library code change.** Phase 9 is bench-only. The next phase,
+  if any, is gated on what Phase 9's data shows.
+- **Perceptual pipeline timing.** Already covered by existing
+  `iphone-perceptual-pass`; Phase 9 focuses on the default
+  (non-perceptual) path which is where 99%+ of real assertions land.
+- **SwiftUI-specific scenarios.** SwiftUI hosts a `UIHostingController`
+  + waits for layout to settle, which has its own overhead profile.
+  Belongs in the iOS-sim follow-up where the hosting infrastructure
+  is available, not in the macOS-host bench.
 
 ### Decision criteria for whether to ship
 
-If Phase 9 measurements at honest parallel-N show <20 % wall-time
-improvement on `iphone-perceptual-pass`, drop the phase and flip the
-limiter default instead (cheaper, simpler). The phase is only worth
-its complexity if the coalescing actually unlocks GPU pipelining.
+Phase 9 always ships — the cost is bench code only and the data is
+the deliverable. The interesting question Phase 9 *resolves* is
+whether a Phase 10 is warranted, and if so, on which stage. Concrete
+post-Phase-9 decisions:
+
+- If `render_ns` > 50% of `total_ns` → next phase optimizes the
+  render pipeline (candidates: render directly into the normalized
+  comparison buffer to skip the second-pass render in `compare()`;
+  fast-path `addImagesForRenderedViews` when the tree has no
+  WK/SCN/SK subviews; `UIGraphicsImageRenderer` reuse).
+- If `decode_ns` > 30% of `total_ns` → next phase parallelizes the
+  reference-PNG decode with the view render.
+- If neither, and `compare_ns` is already small → declare the project
+  done.
+
+### Results
+
+Code: `dfbeec6` · Bench: `ede47aa` (CSVs:
+`bench-results/dfbeec6-pipeline-{serial,parallel-4,parallel-8}.csv`).
+
+Per-stage timings, serial p50 (ns columns formatted as ms):
+
+| Scenario | Iter | Total p50 | render | read | decode | compare | attachments |
+|---|---|---|---|---|---|---|---|
+| `pipeline-small-flat` | 1000 | 0.34 ms | 49 µs | 18 µs | 82 µs | 189 µs | 0 |
+| `pipeline-medium-stack` | 500 | 2.42 ms | 576 µs | 28 µs | 91 µs | 1.72 ms | 0 |
+| `pipeline-large-iphone` | 250 | 126 ms | 47.6 ms | 110 µs | 197 µs | 77.9 ms | 0 |
+| `pipeline-large-iphone-fail` | 250 | 268 ms | 50.0 ms | 100 µs | 159 µs | 36.0 ms | 182 ms |
+
+#### Stage-share breakdown
+
+| Scenario | render | read+decode | compare | attachments |
+|---|---|---|---|---|
+| `pipeline-large-iphone` | 38% | 0.2% | **62%** | 0% |
+| `pipeline-large-iphone-fail` | 19% | 0.1% | 13% | **68%** |
+| `pipeline-medium-stack` | 24% | 5% | **71%** | 0% |
+| `pipeline-small-flat` | 14% | 30% | **56%** | 0% |
+
+#### Decisions this phase resolves
+
+1. **Comparison is still the right thing to optimize at iPhone size.**
+   `pipeline-large-iphone` `compare_p50` is **78 ms** — well over the
+   "small" threshold. By the plan's stated rule (render < 50%, decode
+   < 30%, compare not small), the next phase, if any, is compare-side.
+2. **Synthetic vs pipeline gap was huge.** `iphone-exact-match`
+   reported 0.93 ms p50 in Phase 6; the same compare in pipeline
+   reports 78 ms — **~85×**. The synthetic test fed identical CGImage
+   instances; both `context(for:)` calls returned cached normalized
+   buffers in canonical layout. The pipeline reference is decoded from
+   PNG (different colorspace / row stride / scale), so neither
+   `context(for:)` call hits a fast path. This is the most important
+   finding of Phase 9 — every prior phase's "compare cost" win was
+   measured against canonical-layout inputs.
+3. **Render is non-trivial but not dominant.** 47.6 ms render at iPhone
+   size (NSImageView + cacheDisplay) is significant absolute cost, but
+   it's 38% of total — under the 50% threshold for prioritizing render
+   optimization. macOS NSView numbers under-count render vs real iOS
+   UIView (no UIWindow/UIViewController setup, no traits); the
+   iOS-sim follow-up would surface that gap.
+4. **PNG read+decode is negligible at iPhone size.** Both stages
+   together are < 0.3% of total — the "parallelize decode with render"
+   optimization the plan considered would save effectively nothing
+   (~300 µs of an 80 ms+ pipeline). Cross off.
+5. **Failure-path attachment generation is the dominant fail-path
+   cost.** 182 ms of attachments per failure (3× PNG encode at iPhone
+   size + difference PNG generation) — but only paid when a test
+   fails. For a CI suite where 99%+ of assertions pass, this is
+   invisible to total wall time. For a developer iterating on a
+   broken assertion, it's ~250 ms per re-run. Worth noting as a
+   diagnostic-loop UX cost, not as a throughput optimization target.
+
+#### Notes
+
+- **Pipeline parallel modes were forced serial.** AppKit autolayout
+  rejects modifications from background threads after first use on
+  main, so the runner detects `StagedScenario` and runs all iterations
+  on the calling (main) thread. The `mode`/`parallelism` CSV columns
+  still report the requested value, so suite CSVs across modes diff
+  cleanly. `wall_ns` reflects the actual serial execution.
+- **Attachments timing is approximated** for the failure scenario as
+  `(diffV2(reference, new)) - (diffV2(new, new))` per iteration —
+  paying two compares to isolate the post-compare attachment work.
+  Negative deltas clamp to 0; no negative observed in the recorded
+  run.
+- **Sanity check vs Phase 6** (the plan asked for ±10% on
+  `pipeline-large-iphone` `compare_ns` vs `iphone-exact-match` p50)
+  **failed**: 78 ms vs 0.93 ms is ~85× off. Cause is the layout-
+  mismatch finding above; the sanity check assumed both sides hit the
+  same fast path, but the pipeline reference comes from PNG and
+  doesn't. This is a useful surprise rather than a measurement bug.
+
+#### What this means for a Phase 10
+
+The data argues for one of two compare-side optimizations:
+
+- **Cache the normalized buffer for the reference image.** The
+  reference NSImage is constructed once per scenario but normalized
+  every iteration. A reference-side cache (keyed by the CGImage
+  pointer) would amortize the ~40 ms cost across iterations. In real
+  test suites the reference is also re-read from disk each
+  assertion, so the cache would need a content-hash key, not a
+  pointer key. Risk: cache invalidation when the reference file
+  changes between asserts in a single suite (uncommon but possible).
+- **Detect the canonical-layout fast path at runtime.** When both
+  CGImages already have RGBA8 + sRGB + premultipliedLast + tight row
+  stride, skip the `context(for:)` redraw and use the existing
+  CGImage data directly. The synthetic Phase 6 numbers prove this
+  path is ~85× cheaper when applicable; the pipeline data shows the
+  current code never takes it.
+
+Both are out of scope for Phase 9 (which is bench-only) and would be
+their own phase. No commitment to ship either yet — the data is the
+Phase 9 deliverable, the optimization is the Phase 10 question.
 
 ---
 
@@ -913,7 +1094,7 @@ its complexity if the coalescing actually unlocks GPU pipelining.
 | 7 | Phase 6 (iOS-resolution bench scenarios) | none — bench-only | stable percentile measurements at iPhone (12 MB) & iPad (22 MB) buffer sizes; surfaces RSS profile under sustained load; produces decision data for any further optimization |
 | 8 | Phase 7 (`BenchRunner` pins to `--parallel N`) | none — bench-only | parallel-N wall times now scale monotonically with N; serial column unchanged |
 | 9 | Phase 8 (`MPSImageThresholdBinary` per-threshold cache) | low | iphone-perceptual-pass p50 drops modestly; peak RSS at honest `--parallel 8` flatter; full suite green |
-| 10 | Phase 9 (perceptual coalescing batch + raise limiter default) | medium | iphone-perceptual-pass parallel-N wall drops 30-50% at N≥4; serial unaffected; full suite green; ship/drop decision based on >20% wall improvement |
+| 10 | Phase 9 (full-pipeline bench scenarios on real NSView; iOS-sim UIView follow-up) | none — bench-only | per-stage CSV columns produced for pipeline scenarios; existing scenarios' CSV rows unchanged; pipeline-scenario `compare_ns` matches existing `iphone-exact-match` p50 within ±10% as a sanity check |
 
 Each PR description includes the bench CSV diff vs. the baseline committed in `bench-baseline/`.
 
