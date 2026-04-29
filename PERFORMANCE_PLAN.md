@@ -136,6 +136,21 @@
   a regression on speculation. Code archived on
   `perf/phase10-canonical-decode-archived` (commit `e4746e8`) for
   cherry-pick if Phase 11 is pursued. See Phase 10 section below.
+- **Phase 11** ⛔ attempted, archived. Canonicalize the NSView render
+  via custom `NSBitmapImageRep` + `retagging(with: .sRGB)`. Bench
+  showed real success-path win (`pipeline-large-iphone` 126 → 103 ms,
+  **−18%**; `compare_p50` 78 → 17 ms) but **broke backwards
+  compatibility**: retagging-without-conversion changes rendered byte
+  content vs `bitmapImageRepForCachingDisplay`. Two committed XCTest
+  references (`testNSViewWithLayer`, `testPrecision`) failed with
+  ~18% byte difference; the initial "tests green" reading was Swift
+  Testing only — XCTest auto-record had silently rewritten the PNGs.
+  The conversion-not-retagging variant
+  (`bitmapByConverting(toColorSpace: .sRGB)`) preserves correctness
+  but costs ~38 ms per render, eating the entire success-path win.
+  Code + bench (`bench-results/phase11-pipeline-serial.csv`) archived
+  on `perf/phase11-canonical-render-archived` (commit `add8496`).
+  Phase 12 pursues correctness-safe alternatives instead.
 - **Deferred (replaced by current Phase 9)**: perceptual coalescing
   batch + raising `SNAPSHOT_TESTING_PERCEPTUAL_DIFF_CONCURRENCY`
   default. Would optimize the perceptual path further, but perceptual
@@ -1223,6 +1238,177 @@ expensive than the lazy NSImage path. Worth a one-evening Instruments
 trace before committing to Phase 11; if the gap is `makeImage()`
 overhead, swap to a `vImageConverter`-based path that produces the
 canonical buffer directly without round-tripping through CGImage.
+
+---
+
+## Phase 12 — correctness-safe compare-side wins
+
+### Goal
+
+Reduce `compare()` cost on `pipeline-large-iphone` (78 ms in Phase 9,
+the dominant 62% of pipeline total) **without changing rendered byte
+content** — so existing committed reference PNGs stay byte-equal
+under the new pipeline. Phase 11 proved canonical-on-render breaks
+backwards compatibility; Phase 12 keeps the historical
+`bitmapImageRepForCachingDisplay + cacheDisplay` render path
+untouched and instead speeds up the comparison machinery itself.
+
+### Constraint
+
+- The bytes produced by the public `Snapshotting<NSView, NSImage>.image`
+  / `Snapshotting<UIView, UIImage>.image` strategies must be
+  bitwise-identical to today's output. Same `cacheDisplay`, same
+  `UIGraphicsImageRenderer`, same `pngData()`/`NSImagePNGRepresentation`.
+- `compareContext`'s destination format stays canonical (sRGB +
+  RGBA8 + premultipliedLast + byteOrder32Big + tight stride). The
+  *destination* is what defines comparison semantics; the *path* to
+  reach it is the optimization surface.
+- `memcmp` semantics unchanged — same destination format, same byte
+  comparison, same precision/perceptualPrecision branches.
+
+### Workstreams
+
+Four candidates, ranked by expected ROI. Stack-able: (A) and (B)
+combine for the largest projected win.
+
+#### A. vImage-accelerated `compareContext` (highest ROI)
+
+Replace `CGContext.draw(cgImage, ...)` inside `compareContext` with
+a `vImageConverter` + `vImageConvert_AnyToAny` path. vImage's
+SIMD-optimized pixel-format converters are typically 2–3× faster
+than `CGContext.draw` for the kind of conversion this hot path
+needs (Display P3 + premultipliedFirst + non-tight stride →
+sRGB + premultipliedLast + tight stride).
+
+- Implementation: build a `vImage_CGImageFormat` from `cgImage`,
+  build a destination `vImage_CGImageFormat` matching our canonical
+  layout, `vImageConverter_CreateWithCGImageFormat` (cache the
+  converter per source-format key), `vImageConvert_AnyToAny` into
+  the destination buffer.
+- Fallback: keep the existing `CGContext.draw` path for any source
+  format `vImageConverter_CreateWithCGImageFormat` rejects (rare
+  edge formats — grayscale, planar, floating-point).
+- Projection: each redraw 38 ms → ~15 ms. `compare()` 78 → ~30 ms.
+  **Pipeline total: 126 → ~78 ms (~38% reduction).**
+- Risk: vImage's conversion may produce slightly different rounding
+  than `CGContext.draw` for borderline pixels. Validate against the
+  full test suite + the `ImageNormalizationEdgeCasesTests` from
+  Phase 3 follow-up (12 tests covering non-premultiplied alpha,
+  Display P3, grayscale). If any test fails, gate vImage path
+  behind a runtime check that both source and destination are in
+  the "safe" format space and fall back otherwise.
+
+#### B. Parallelize the two compare-side redraws
+
+Today `compare()` runs ref-redraw → new-redraw → memcmp serially.
+Both redraws are CPU-bound, independent, and write to separate
+buffers. Run them via `DispatchQueue.concurrentPerform(iterations: 2)`
+or a 2-element `DispatchGroup`.
+
+- Implementation: hoist buffer allocation before the parallel
+  block; index 0 handles old, index 1 handles new; main thread
+  joins, then memcmp.
+- Projection: total compare time goes from `oldRedraw + newRedraw`
+  to `max(oldRedraw, newRedraw)`. With Phase 9 baseline (~38 ms
+  each): 78 → ~38 ms. **Pipeline total: 126 → ~88 ms (~30%
+  reduction).** Stacks with (A): max(15, 15) ≈ 15 ms. **Combined
+  pipeline total: 126 → ~65 ms (~48% reduction).**
+- Risk: thread-safety inside `compareContext` (CG is generally
+  thread-safe per-context; we're using two distinct contexts, so
+  fine). Bench under `--parallel N` to confirm we don't degrade
+  multi-test wall time by oversubscribing the CPU — at high
+  parallelism each compare already has many in-flight calls;
+  parallelizing within compare may starve other workers. Gate via
+  the same `SnapshotTestingPerceptualDiffLimiter` pattern Phase 2
+  used.
+
+#### C. vImage-accelerated `decodeCanonicalCGImage` (resurrects Phase 10 cleanly)
+
+Reapply Phase 10's reference-side fast path (canonical-layout PNG
+decode in `fromData`), but use `vImageConverter` for the
+canonical conversion instead of `CGContext.draw + makeImage`. The
+Phase 10 plan called this out as the resolution to its open question
+(why decode was 52 ms vs the equivalent 38 ms inside compare — the
+CGImage round-trip adds setup overhead).
+
+- Implementation: `CGImageSourceCreateImageAtIndex` →
+  `vImage_Buffer.init(cgImage:format:)` → `vImageConvert_AnyToAny`
+  → wrap the destination buffer as a `CGImage`.
+- Projection: decode goes 52 → ~15 ms. With Phase 10 reapplied:
+  pipeline `render 48 + decode 15 + compare 41 = 104 ms` (~17%
+  reduction). Stacks with (A): `compare 41 → ~15 ms` →
+  `render 48 + decode 15 + compare 15 = 78 ms` (~38% reduction —
+  same as (A) alone). So (C) is only useful if Phase 10's
+  reference-side fast path matters independently. **Skip unless
+  (A) doesn't deliver projected gains on its own.**
+
+#### D. Lazy/deferred attachment generation (fail-path only)
+
+Doesn't help the success path. Phase 9's `pipeline-large-iphone-fail`
+attachments stage is 182 ms (PNG-encoding 3 images: reference, new,
+diff). Most CI failure handlers only consume the diff — restructure
+`diffV2` to encode attachments on-demand via a closure rather than
+eagerly. Optional, low priority. Tackle only if user feedback
+indicates fail-path latency matters.
+
+### Acceptance criteria
+
+- `swift test` green: 24/24 tests with the same 3 expected
+  `withKnownIssue` failures. **All committed reference PNGs
+  unchanged on disk after the test run** (this is the canary that
+  caught Phase 11 — XCTest auto-record will silently rewrite
+  references if comparison fails, masking byte changes).
+- `pipeline-large-iphone` total p50 ≤ 90 ms (target: ~65 ms with
+  A+B stacked). `pipeline-large-iphone-fail` total p50 within ±5%
+  of Phase 9 baseline (no fail-path regression).
+- Edge-case suite (`ImageNormalizationEdgeCasesTests`, 12 tests)
+  green under both the new and `SNAPSHOT_TESTING_LEGACY_NORMALIZATION=1`
+  paths.
+- Bench CSV committed under `bench-results/<sha>-pipeline-serial.csv`
+  with per-stage breakdown.
+
+### Order of operations
+
+1. (A) alone: implement vImage compareContext, run full suite +
+   bench, validate no PNG drift, commit if numbers match
+   projection.
+2. (B) on top of (A): add parallelization, bench again. Ship if
+   stacked win materializes and parallel modes don't regress.
+3. (C) considered only if (A)'s actual win underperforms — would
+   indicate the conversion isn't the dominant cost and decode-side
+   work matters.
+4. (D) deferred unless fail-path latency surfaces in user reports.
+
+### Risks
+
+- **vImage rounding differences.** vImage and CGContext use
+  different conversion code paths; for some color/alpha
+  combinations the LSB may differ. The `ImageNormalizationEdgeCasesTests`
+  suite is the primary canary. If a test fails by 1 byte in some
+  pixels, gate vImage to the "safe" format pairs (sRGB→sRGB,
+  P3→sRGB, deviceRGB→sRGB) and fall back to CGContext for others.
+- **Parallelism overhead at small image sizes.** For
+  `pipeline-small-flat` (sub-ms compare), thread spin-up overhead
+  may dominate. Use a size threshold (e.g., only parallelize when
+  `byteCount > 256 KB`) so small assertions stay on the serial
+  path.
+- **CGImage backing assumptions in vImage path.** Some CGImages
+  have callback-based data providers that materialize bytes lazily.
+  `vImage_Buffer.init(cgImage:)` handles this but at the cost of
+  a synchronous materialization. Verify the bench numbers reflect
+  realistic source images, not pre-materialized ones.
+
+### Out of scope
+
+- Changing the render path on either NSView or UIView (Phase 11
+  established this breaks user references).
+- Changing the on-disk PNG format or the `pngData()` /
+  `NSImagePNGRepresentation` calls.
+- Touching the perceptual path — Phase 8 already optimized the
+  MPS kernel cache; perceptual is opt-in and not the dominant
+  cost on the standard pipeline.
+- iOS UIView pipeline scenarios — wait until vImage win is
+  validated on macOS before adding the iOS surface.
 
 ---
 
