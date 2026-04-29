@@ -73,15 +73,20 @@
   Phase 6's three conclusions still hold under the new measurements
   (canonical-layout fast-path not worth doing; `defer { deallocate() }`
   returns pages cleanly; perceptual is the dominant per-call cost).
-- **Phase 8** pending — cache `MPSImageThresholdBinary` per threshold
-  value in `ThresholdImageProcessorKernel`. Currently constructed every
-  perceptual call (`UIImage.swift:548`); a small per-threshold cache
-  amortizes the MPS kernel + Metal heap allocation across the suite.
-  Modest perceptual-path win; concrete and shippable. Driven by the
-  Phase 6 follow-up investigation showing perceptual RSS (~1.3 GB at
-  parallel-8) is a fixed Metal heap floor — not per-call retention —
-  but the per-call MPS construction is one of few CPU-side levers
-  remaining.
+- **Phase 8** ✅ code `f490a71`, bench `0d5435a`. Added a private
+  `[Float: MPSImageThresholdBinary]` cache (`NSLock`-guarded) inside
+  `ThresholdImageProcessorKernel`; `process(...)` now looks up the
+  kernel by `thresholdValue` and constructs only on miss. MPS kernels
+  are documented thread-safe for encoding once constructed, so the
+  cached kernel is encoded into per-call command buffers without
+  serialization. Bench impact at iOS sizes (vs `2541c35`):
+  iphone-perceptual-pass parallel-4 p95 **−7.6%** (62.6 → 57.9 ms),
+  p99 **−15%** (69.3 → 58.7 ms); parallel-8 peak RSS **−8%**
+  (1368 → 1258 MB). Serial p50 within noise. Non-perceptual
+  scenarios unaffected (±5% noise band). The win is mostly tail-
+  latency tightening + a Metal-heap-floor drop, not p50 throughput
+  — MPS construction was either cheaper than estimated or already
+  overlapped with the GPU sync. Edge-case + precision tests pass.
 - **Phase 9** pending — internal coalescing-window batch for the
   perceptual path. Sync `Diffing` API stays; under the hood, perceptual
   compares enqueue onto a shared coordinator that submits up to N
