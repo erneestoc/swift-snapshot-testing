@@ -54,6 +54,27 @@
   CG `draw` already runs faster than the RAM-bandwidth ceiling for two
   full memcpys, so bypassing it would save little. See Phase 6 Results
   for per-call → suite-level extrapolations.
+- **Phase 7** pending — fix `BenchRunner` so `--parallel N` actually pins
+  to N workers. Currently uses `DispatchQueue.concurrentPerform` which
+  always uses the full machine; explains why parallel-4 ≈ parallel-8
+  wall in Phase 6 results. Bench-only, no library impact, but unblocks
+  honest contention measurements for Phase 8 and any future tuning.
+- **Phase 8** pending — cache `MPSImageThresholdBinary` per threshold
+  value in `ThresholdImageProcessorKernel`. Currently constructed every
+  perceptual call (`UIImage.swift:548`); a small per-threshold cache
+  amortizes the MPS kernel + Metal heap allocation across the suite.
+  Modest perceptual-path win; concrete and shippable. Driven by the
+  Phase 6 follow-up investigation showing perceptual RSS (~1.3 GB at
+  parallel-8) is a fixed Metal heap floor — not per-call retention —
+  but the per-call MPS construction is one of few CPU-side levers
+  remaining.
+- **Deferred (no current phase planned)**: async / batched perceptual
+  render. Phase 6 investigation showed serial perceptual p50 (52 ms)
+  is dominated by `context.render(...)` GPU sync, not compute (parallel
+  throughput hits ~5 ms/iter). A 10× per-call latency cut is
+  theoretically available by replacing the sync render with batched
+  Metal command buffers, but it would change the diffing API surface
+  and isn't justified without a user demanding it.
 
 ### Resume context
 
@@ -608,6 +629,129 @@ Code: `eced587` · Bench: `c9e32ff` (CSVs:
 
 ---
 
+## Phase 7 — Bench harness: pin workers to `--parallel N`
+
+`BenchRunner` currently uses `DispatchQueue.concurrentPerform(iterations:)`,
+which farms work onto GCD's global pool — always sized to the full
+machine, regardless of the CLI's `--parallel N` value. That's why
+Phase 6 found `parallel-4` ≈ `parallel-8` wall on every scenario:
+both modes were running with whatever GCD's worker count happened to
+be (typically `activeProcessorCount`).
+
+This phase is bench-only — no library changes, no shipped behavior
+change — but it unblocks honest contention measurements. Phase 8's
+gating numbers and any future "what's the optimal limiter default"
+question can't be answered without it.
+
+### Changes
+
+1. **`Sources/SnapshotTestingBenchmarks/Harness/Runner.swift`** —
+   replace `DispatchQueue.concurrentPerform(iterations:)` with an
+   explicit N-worker pool. Two equivalent shapes:
+   - N `DispatchQueue.global()` work items + a counter → `DispatchGroup`
+     to wait, with a shared atomic iteration counter, OR
+   - A `DispatchSemaphore(value: N)` gate inside the existing
+     `concurrentPerform` body so at most N iterations execute
+     concurrently.
+   The semaphore variant is the smaller diff. The N-worker pool
+   variant is more honest (samples truly come from N threads), which
+   matters for the per-iter `t1 - t0` measurements.
+2. **`scenario`'s warmup** must still run on a single thread before
+   the parallel section to avoid cold-start contamination of p50.
+3. CSV `parallelism` column already exists and now reflects reality.
+
+### Verification
+
+- Re-run Phase 6's iOS suite at `--parallel 2`, `--parallel 4`,
+  `--parallel 8`. Wall times should now monotonically improve with N
+  (until RAM-bandwidth saturation kicks in around 4 on Apple Silicon).
+- Existing serial baselines unchanged.
+- Phase 6 conclusions stand — the perceptual GPU-sync floor and CG
+  draw fast-path findings don't depend on this.
+
+### Risks
+
+- None for the library. For the bench, slightly more code in
+  `Runner.swift`. The risk of stale baselines is real but manageable:
+  the serial column is unaffected, and Phase 6's parallel numbers
+  become "lower bound on what could be measured at the time" rather
+  than wrong.
+
+### Out of scope
+
+- Cross-machine parallel scaling curves (different M-series chips
+  have different bandwidth profiles). Each developer's bench remains
+  local.
+
+---
+
+## Phase 8 — Cache `MPSImageThresholdBinary` in the perceptual path
+
+Per Phase 6's follow-up investigation, the perceptual diff path's RSS
+(~1.3 GB at parallel-8 on 12 MB iPhone inputs) is dominated by a fixed
+Metal/CIContext heap floor — not per-call retention. Iteration count
+doesn't move it; CIContext pool size doesn't move it; concurrency
+limit doesn't move it.
+
+The remaining CPU-side lever is `ThresholdImageProcessorKernel.process`
+(`UIImage.swift:548`), which constructs a fresh `MPSImageThresholdBinary`
+**every perceptual call**. MPS kernels are documented thread-safe for
+encoding once constructed; the `thresholdValue` parameter is bound at
+construction but `linearGrayColorTransform` is `nil` and `device` is
+the singleton.
+
+In practice each `Diffing.image(perceptualPrecision:)` instance has
+exactly one threshold value (`(1 - perceptualPrecision) * 100`), so a
+small dictionary keyed by `Float` collapses to 1-2 entries per process
+and amortizes the MPS construction cost across the whole suite.
+
+### Changes
+
+1. **`Sources/SnapshotTesting/Snapshotting/UIImage.swift`** — inside
+   `ThresholdImageProcessorKernel`, add a private static
+   `[Float: MPSImageThresholdBinary]` cache guarded by an `NSLock`
+   (or `os_unfair_lock`). `process(...)` looks up by `thresholdValue`,
+   constructs on miss, returns the cached kernel.
+2. The cached kernel is encoded to the per-call `commandBuffer`; MPS
+   kernels are stateless w.r.t. encoding, so concurrent encoders are
+   safe.
+
+### Verification
+
+- `iphone-perceptual-pass` p50 expected to drop modestly (single-digit
+  ms range — MPS construction is ~1-2 ms but happens inside the
+  GPU-sync block, so the visible win depends on whether it overlapped
+  with Metal scheduling).
+- Peak RSS at parallel-8 expected to drop a small amount (one fewer
+  MPS Metal heap per active call).
+- Full XCTest suite green; perceptual edge-case tests
+  (`PerceptualPass`, `PerceptualFail`, plus existing perceptual
+  fixtures in `Tests/SnapshotTestingTests`) unchanged.
+- Use the Phase 7 bench harness fix to measure at honest
+  `--parallel 2` / `4` / `8` so the win isn't masked by the current
+  always-N-cores behavior.
+
+### Risks
+
+- **MPS kernel thread-safety for encoding**: documented safe per
+  Apple's MPS guide, but worth a sanity check that we can encode the
+  same kernel into multiple command buffers concurrently. If unsafe,
+  fall back to one cache entry per (threshold, thread) — still
+  amortizes construction across iterations on the same thread.
+- **Cache lifetime**: cache lives forever (process-wide static). Fine
+  in practice; threshold value is bounded by `Float` precision and
+  tests rarely use more than 1-2 distinct precisions. If we ever
+  worry about unbounded growth, an LRU is trivial to add.
+
+### Out of scope
+
+- Caching the upstream CIFilters (`CILabDeltaE`, `CIAreaAverage`,
+  `CIAreaMaximum`). CIFilter is already a pooled, recycled type
+  managed by CoreImage; explicit caching there has historically
+  made things worse.
+
+---
+
 ## Skipped from source doc
 
 - **#8 pixel-based precision** — deferred per decision above.
@@ -626,6 +770,8 @@ Code: `eced587` · Bench: `c9e32ff` (CSVs:
 | 5 | Phase 4 (UIGraphicsImageRenderer) | low | parity |
 | 6 | Phase 5 (normalized buffer pool) | low | flatter peak RSS at parallel-8; wall ≤ Phase 4 |
 | 7 | Phase 6 (iOS-resolution bench scenarios) | none — bench-only | stable percentile measurements at iPhone (12 MB) & iPad (22 MB) buffer sizes; surfaces RSS profile under sustained load; produces decision data for any further optimization |
+| 8 | Phase 7 (`BenchRunner` pins to `--parallel N`) | none — bench-only | parallel-N wall times now scale monotonically with N; serial column unchanged |
+| 9 | Phase 8 (`MPSImageThresholdBinary` per-threshold cache) | low | iphone-perceptual-pass p50 drops modestly; peak RSS at honest `--parallel 8` flatter; full suite green |
 
 Each PR description includes the bench CSV diff vs. the baseline committed in `bench-baseline/`.
 
