@@ -54,11 +54,13 @@
   CG `draw` already runs faster than the RAM-bandwidth ceiling for two
   full memcpys, so bypassing it would save little. See Phase 6 Results
   for per-call → suite-level extrapolations.
-- **Phase 7** pending — fix `BenchRunner` so `--parallel N` actually pins
-  to N workers. Currently uses `DispatchQueue.concurrentPerform` which
-  always uses the full machine; explains why parallel-4 ≈ parallel-8
-  wall in Phase 6 results. Bench-only, no library impact, but unblocks
-  honest contention measurements for Phase 8 and any future tuning.
+- **Phase 7** ✅ code `1799be3`. Replaced `DispatchQueue.concurrentPerform`
+  with N long-running workers pulling iterations from a shared counter,
+  joined via `DispatchGroup`. The CLI's `--parallel N` now caps in-flight
+  `runOnce()` calls to exactly N. Smoke run on `iphone-1px-diff` (iters=200):
+  serial 856 ms · p2 424 ms · p4 220 ms · p8 117 ms — near-linear scaling;
+  per-iter p50 stays ~4.2-4.5 ms across all N (work itself unchanged).
+  Bench-only, no library code touched.
 - **Phase 8** pending — cache `MPSImageThresholdBinary` per threshold
   value in `ThresholdImageProcessorKernel`. Currently constructed every
   perceptual call (`UIImage.swift:548`); a small per-threshold cache
