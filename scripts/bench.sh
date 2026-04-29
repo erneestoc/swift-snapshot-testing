@@ -7,7 +7,7 @@
 #   scripts/bench.sh                       # full sweep (serial + parallel-4 + parallel-8)
 #   scripts/bench.sh --quick               # smoke run with --scale 0.1
 #   scripts/bench.sh --only NAME[,NAME...] # restrict to specific scenarios
-#   scripts/bench.sh --suite ios|all       # opt-in iOS-resolution suite
+#   scripts/bench.sh --suite ios|pipeline|all  # opt-in suite (iOS, full-pipeline, or all)
 #   BENCH_OUT_DIR=/tmp/x scripts/bench.sh  # override output dir
 #
 # Exit non-zero if any mode fails.
@@ -74,6 +74,8 @@ export DYLD_LIBRARY_PATH="$PLATFORM_DIR/Developer/usr/lib${DYLD_LIBRARY_PATH:+:$
 SUITE_TAG=""
 if [[ "$SUITE" == "ios" ]]; then
   SUITE_TAG="-ios"
+elif [[ "$SUITE" == "pipeline" ]]; then
+  SUITE_TAG="-pipeline"
 elif [[ "$SUITE" == "all" ]]; then
   SUITE_TAG="-all"
 fi

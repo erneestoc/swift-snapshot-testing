@@ -4,6 +4,7 @@ import Foundation
 enum BenchSuite: String {
   case `default`
   case ios
+  case pipeline
   case all
 }
 
@@ -42,7 +43,7 @@ func parseArgs(_ args: [String]) -> CLIOptions {
       if i < args.count, let s = BenchSuite(rawValue: args[i]) {
         opts.suite = s
       } else {
-        FileHandle.standardError.write(Data("invalid --suite value (expected: default, ios, all)\n".utf8))
+        FileHandle.standardError.write(Data("invalid --suite value (expected: default, ios, pipeline, all)\n".utf8))
         exit(2)
       }
     case "--help", "-h":
@@ -55,7 +56,8 @@ func parseArgs(_ args: [String]) -> CLIOptions {
         --only NAMES      Run only scenarios whose names match one of NAMES (comma-separated).
         --scale F         Multiply iteration counts by F (e.g. 0.1 for a smoke run).
         --suite NAME      Scenario suite: default (current scenarios), ios (iOS-resolution suite),
-                          or all (both). Default: default.
+                          pipeline (full-pipeline NSView scenarios with per-stage timing),
+                          or all (everything). Default: default.
         """)
       exit(0)
     default:
@@ -79,6 +81,29 @@ struct ScaledScenario: Scenario {
   func setUp() { inner.setUp() }
   func runOnce() { inner.runOnce() }
   func tearDown() { inner.tearDown() }
+}
+
+struct ScaledStagedScenario: StagedScenario {
+  let name: String
+  let iterations: Int
+  let stageNames: [String]
+  private let inner: StagedScenario
+  init(_ inner: StagedScenario, scale: Double) {
+    self.inner = inner
+    self.name = inner.name
+    self.iterations = max(1, Int(Double(inner.iterations) * scale))
+    self.stageNames = inner.stageNames
+  }
+  func setUp() { inner.setUp() }
+  func tearDown() { inner.tearDown() }
+  func runOnceStaged() -> [UInt64] { inner.runOnceStaged() }
+}
+
+func scale(_ scenario: Scenario, by factor: Double) -> Scenario {
+  if let staged = scenario as? StagedScenario {
+    return ScaledStagedScenario(staged, scale: factor)
+  }
+  return ScaledScenario(scenario, scale: factor)
 }
 
 let opts = parseArgs(CommandLine.arguments)
@@ -107,11 +132,26 @@ func makeIOSScenarios() -> [Scenario] {
   ]
 }
 
+func makePipelineScenarios() -> [Scenario] {
+  #if os(macOS)
+    return [
+      PipelineSmallFlat(),
+      PipelineMediumStack(),
+      PipelineLargeIPhone(),
+      PipelineLargeIPhoneFail(),
+    ]
+  #else
+    FileHandle.standardError.write(Data("pipeline suite is macOS-only\n".utf8))
+    return []
+  #endif
+}
+
 let allScenarios: [Scenario] = {
   switch opts.suite {
   case .default: return defaultScenarios
   case .ios: return makeIOSScenarios()
-  case .all: return defaultScenarios + makeIOSScenarios()
+  case .pipeline: return makePipelineScenarios()
+  case .all: return defaultScenarios + makeIOSScenarios() + makePipelineScenarios()
   }
 }()
 
@@ -121,7 +161,7 @@ let filtered: [Scenario] = opts.only.isEmpty
 
 let scenarios: [Scenario] = opts.iterationsScale == 1.0
   ? filtered
-  : filtered.map { ScaledScenario($0, scale: opts.iterationsScale) }
+  : filtered.map { scale($0, by: opts.iterationsScale) }
 
 if scenarios.isEmpty {
   FileHandle.standardError.write(Data("no scenarios selected\n".utf8))
@@ -148,9 +188,10 @@ if let path = opts.outputPath {
   try CSV.write(results, to: url)
   FileHandle.standardError.write(Data("wrote \(results.count) rows to \(path)\n".utf8))
 } else {
-  print(CSV.header.joined(separator: ","))
+  let stageCols = CSV.stageColumns(from: results)
+  print(CSV.header(stageColumns: stageCols).joined(separator: ","))
   for r in results.sorted(by: { $0.name < $1.name }) {
-    print(CSV.row(r))
+    print(CSV.row(r, stageColumns: stageCols))
   }
 }
 #else
