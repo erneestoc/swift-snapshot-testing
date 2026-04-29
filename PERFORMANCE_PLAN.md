@@ -151,6 +151,18 @@
   Code + bench (`bench-results/phase11-pipeline-serial.csv`) archived
   on `perf/phase11-canonical-render-archived` (commit `add8496`).
   Phase 12 pursues correctness-safe alternatives instead.
+- **Phase 12-A** ✅ vImage-accelerated compare buffer load. Replaced
+  the `CGContext.draw` redraw inside the modern `compare()` path
+  (NSImage.swift / UIImage.swift) with `vImageConverter` +
+  `vImageConvert_AnyToAny` via a new internal helper
+  `loadNormalizedCompareBuffer`. Per-source-format converter cache
+  amortizes setup. Falls back to `CGContext.draw` for source formats
+  vImage rejects. Bench: `pipeline-large-iphone` total p50
+  **126 → 74 ms (−42%)**, compare_p50 **78 → 24 ms (−69%)**.
+  parallel-8 gain identical (no contention). Fail-path total
+  unchanged within ±0.5%. All 40 XCTests pass, all committed PNG
+  references byte-identical (sha unchanged before/after run). Bench
+  `bench-results/8c30049-dirty-pipeline-{serial,parallel-4,parallel-8}.csv`.
 - **Deferred (replaced by current Phase 9)**: perceptual coalescing
   batch + raising `SNAPSHOT_TESTING_PERCEPTUAL_DIFF_CONCURRENCY`
   default. Would optimize the perceptual path further, but perceptual
@@ -1271,7 +1283,13 @@ untouched and instead speeds up the comparison machinery itself.
 Four candidates, ranked by expected ROI. Stack-able: (A) and (B)
 combine for the largest projected win.
 
-#### A. vImage-accelerated `compareContext` (highest ROI)
+#### A. vImage-accelerated `compareContext` (highest ROI) — ✅ shipped
+
+**Result (commit pending):** `pipeline-large-iphone` total p50
+**126 → 74 ms (−42%)**, compare_p50 **78 → 24 ms (−69%)**. Beat the
+~78 ms projection by 4 ms. Same gain at parallel-8. Fail-path
+total within ±0.5%. PNG references byte-identical, 40 XCTests
+pass. Implementation: `Sources/SnapshotTesting/Snapshotting/Internal/CompareBufferLoader.swift`.
 
 Replace `CGContext.draw(cgImage, ...)` inside `compareContext` with
 a `vImageConverter` + `vImageConvert_AnyToAny` path. vImage's

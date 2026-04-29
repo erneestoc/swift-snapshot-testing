@@ -125,15 +125,15 @@
     // destination byte on draw.
     let oldBuffer = UnsafeMutableRawPointer.allocate(byteCount: byteCount, alignment: 16)
     defer { oldBuffer.deallocate() }
-    guard let oldData = context(for: oldCgImage, data: oldBuffer)?.data else {
+    guard loadNormalizedCompareBuffer(from: oldCgImage, into: oldBuffer) else {
       return "Reference image's data could not be loaded."
     }
     let newBuffer = UnsafeMutableRawPointer.allocate(byteCount: byteCount, alignment: 16)
     defer { newBuffer.deallocate() }
-    guard let newData = context(for: newCgImage, data: newBuffer)?.data else {
+    guard loadNormalizedCompareBuffer(from: newCgImage, into: newBuffer) else {
       return "Newly-taken snapshot's data could not be loaded."
     }
-    if memcmp(oldData, newData, byteCount) == 0 { return nil }
+    if memcmp(oldBuffer, newBuffer, byteCount) == 0 { return nil }
     if precision >= 1, perceptualPrecision >= 1 {
       return "Newly-taken snapshot does not match reference."
     }
