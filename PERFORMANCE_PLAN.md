@@ -122,6 +122,20 @@
   first use; `mode`/`parallelism` columns still report the requested
   value to keep CSVs diff-comparable. The iOS-sim UIView follow-up
   remains out of scope for this phase.
+- **Phase 10** ⛔ reverted. Attempted canonical-layout PNG decode in
+  `fromData` plus a `compare()` fast path that skips the per-call
+  redraw when both sides are already canonical. Bench
+  (`bench-results/phase10-pipeline-serial.csv`): net regression in
+  isolation (`pipeline-large-iphone` 126 → 150 ms, **+19%**;
+  +20–26% on smaller pipeline scenarios). The compare-side savings
+  landed (~37 ms off compare) but canonicalize-during-decode added
+  ~52 ms — cost shifted, not eliminated, because the rendered side
+  is still non-canonical so `compare()` still pays one redraw. The
+  measurable win requires Phase 11 (canonicalize the render side),
+  which has unresolved feasibility risk; reverted rather than carry
+  a regression on speculation. Code archived on
+  `perf/phase10-canonical-decode-archived` (commit `e4746e8`) for
+  cherry-pick if Phase 11 is pursued. See Phase 10 section below.
 - **Deferred (replaced by current Phase 9)**: perceptual coalescing
   batch + raising `SNAPSHOT_TESTING_PERCEPTUAL_DIFF_CONCURRENCY`
   default. Would optimize the perceptual path further, but perceptual
@@ -1070,6 +1084,145 @@ assertion regardless of whether its reference recurs.
 Out of scope for Phase 9 (bench-only) and would be its own phase. The
 data is the Phase 9 deliverable; the optimization is the Phase 10
 question.
+
+---
+
+## Phase 10 — canonical-layout PNG decode + compare fast path
+
+### Goal
+
+Move the per-assertion sRGB+RGBA8 normalization off the hot path. Phase
+9 measured `pipeline-large-iphone` `compare_p50` at 78 ms — two
+`context(for:)` redraws, one per side, each ~38 ms. The reference side
+hits the slow path because `UIImage(data:)` / `NSImage(data:)` decode
+PNG into whatever layout ImageIO picks (often Display P3 +
+premultipliedFirst), forcing `compare()`'s `CGBitmapContext` to do real
+colorspace + alpha conversion.
+
+Phase 10 normalizes during `fromData` instead of during `compare`, then
+adds a fast path so `compare()` skips the redraw whenever both sides
+are already canonical.
+
+### Changes shipped
+
+- `Sources/SnapshotTesting/Snapshotting/Internal/CanonicalImage.swift`
+  (new). Defines the canonical layout (RGBA8 / sRGB /
+  premultipliedLast / `byteOrder32Big` / `width*4` stride), the
+  `compareContext` helper (deduped from `UIImage.swift` /
+  `NSImage.swift`), the `decodeCanonicalCGImage` PNG entry point, and
+  `loadCompareBuffer` — which returns the CGImage's data provider when
+  the input is already canonical (no allocation, no redraw) or
+  otherwise allocates and redraws.
+- `UIImage.swift` / `NSImage.swift`: `fromData` now goes through
+  `decodeCanonicalCGImage` (with a fall back to the original decoder on
+  ImageIO failure); `compare()` calls `loadCompareBuffer` instead of
+  doing the alloc-and-draw inline. Same downstream byte semantics.
+  `legacyCompare` and `normalizedComponentDiff` rewired to the shared
+  `compareContext`. The `byteOrder32Big | premultipliedLast` bitmap
+  info is pinned explicitly so the resulting CGImage's bitmapInfo is
+  reproducible across releases — needed for `isCanonicalForCompare` to
+  detect a canonical CGImage with a single equality check.
+
+### Results
+
+Code: this commit (parallel runs deferred — pipeline scenarios are
+forced serial per Phase 9). Bench:
+`bench-results/phase10-pipeline-serial.csv`.
+
+Per-stage timings, serial p50 (ms):
+
+| Scenario | Iter | Total | render | read | decode | compare | attachments |
+|---|---|---|---|---|---|---|---|
+| `pipeline-small-flat` | 1000 | 0.41 | 63 µs | 24 µs | 229 µs | 93 µs | 0 |
+| `pipeline-medium-stack` | 500 | 3.05 | 704 µs | 41 µs | 1.35 ms | 914 µs | 0 |
+| `pipeline-large-iphone` | 250 | 150 | 58.6 ms | 107 µs | 52.2 ms | 40.6 ms | 0 |
+| `pipeline-large-iphone-fail` | 250 | 321 | 61.2 ms | 103 µs | 27.6 ms | 38.3 ms | 194 ms |
+
+vs Phase 9 baseline (`dfbeec6`):
+
+| Scenario | Δ Total | Δ decode | Δ compare |
+|---|---|---|---|
+| `pipeline-small-flat` | +21% (0.34 → 0.41) | +0.15 ms | −0.10 ms |
+| `pipeline-medium-stack` | +26% (2.42 → 3.05) | +1.26 ms | −0.81 ms |
+| `pipeline-large-iphone` | +19% (126 → 150) | +52.0 ms | −37.3 ms |
+| `pipeline-large-iphone-fail` | +20% (268 → 321) | +27.4 ms | +2.3 ms |
+
+### What the data says
+
+**Phase 10 in isolation is a net regression.** The compare-side savings
+land as predicted (≈37 ms off `pipeline-large-iphone` compare from
+killing one of two redraws), but the canonicalization work shifts into
+decode and grows by ≈52 ms — net +15 ms per assertion at iPhone
+resolution. Smaller scenarios pay a similar absolute overhead that
+dominates their tiny compare savings.
+
+The asymmetry is real: `compare()`'s reference-side redraw was 38 ms,
+but the same conversion paid eagerly during `fromData` is 52 ms.
+Suspected cause: Phase 9's measured 0.2 ms decode was actually
+`NSImage(data:)`'s lazy decode — the real PNG-decode + colorspace
+work landed inside `compare()` and was accounted as compare cost.
+Pulling it forward to `fromData` adds CGImageSource setup overhead
+(~14 ms at iPhone size) on top.
+
+**Why the win didn't materialize:** the rendered (new) side is still
+non-canonical — `NSView.cacheDisplay` produces whatever layout AppKit
+picks. So `compare()` still has to redraw the new image (~38 ms). The
+fast path only fires on the reference. Net: shifted cost without
+eliminating it.
+
+### Decision
+
+**Reverted.** Code archived on `perf/phase10-canonical-decode-archived`
+(commit `e4746e8`). The branch holds `CanonicalImage.swift` plus the
+`fromData` / `compare()` changes to `UIImage.swift` and `NSImage.swift`
+as a single commit, so reviving the work is `git cherry-pick`.
+
+Why revert rather than ship as Phase 11 prep:
+
+1. **Net regression in isolation.** +19% on `pipeline-large-iphone`,
+   +20–26% on smaller pipeline scenarios. Shipping a measured
+   regression on the bet of future work is hard to defend if Phase 11
+   slips or doesn't deliver the projected savings.
+2. **Phase 11 has unresolved feasibility risk.** Canonicalize-on-render
+   means controlling the bitmap layout produced by
+   `NSView.cacheDisplay` / `UIGraphicsImageRenderer`. AppKit/UIKit
+   don't fully expose pixel-format control on those paths; the work
+   may require a from-scratch `CGContext`-based capture, which has
+   its own correctness surface (Hi-DPI scaling, view-hierarchy
+   side-effects, off-screen rendering quirks).
+3. **The 14 ms decode-overhead delta is unexplained.** Even granting
+   Phase 11's render-side win, the eager-decode overhead in this
+   archived attempt was ~52 ms vs the ~38 ms the same conversion cost
+   inside `compare()`. Phase 11's projected total assumes that gap
+   closes; without an Instruments trace, it's a guess.
+4. **Re-introducing the helpers atomically with Phase 11 is cheaper
+   than carrying a regression.** The helpers are ~150 lines of clean,
+   self-contained code. When Phase 11 lands, cherry-pick the archive
+   commit and adjust — no work is lost.
+
+What Phase 11 would need to revive this:
+
+- Canonicalize the render side so both sides hit the
+  `loadCompareBuffer` fast path. Target: `compare()` collapses to
+  `memcmp` (sub-ms at iPhone size, validated by Phase 6's 0.93 ms
+  `iphone-exact-match`).
+- Resolve the open question below before committing — if the
+  decode-side overhead doesn't close, the projected combined win
+  shrinks materially.
+- Projected Phase 10 + Phase 11 combined (assuming the open question
+  resolves favorably): render canonical ~50 ms + decode canonical
+  ~5–10 ms + compare < 1 ms = **~55–60 ms vs Phase 9's 126 ms**
+  (~55% reduction).
+
+### Open question (carry into Phase 11 research)
+
+Why is canonicalize-during-decode 52 ms while the equivalent redraw
+inside `compare()` is 38 ms? `CGImageSourceCreateImageAtIndex` plus
+`CGContext.draw` plus `CGContext.makeImage` should be no more
+expensive than the lazy NSImage path. Worth a one-evening Instruments
+trace before committing to Phase 11; if the gap is `makeImage()`
+overhead, swap to a `vImageConverter`-based path that produces the
+canonical buffer directly without round-tripping through CGImage.
 
 ---
 
