@@ -68,13 +68,20 @@
   parallel-8) is a fixed Metal heap floor — not per-call retention —
   but the per-call MPS construction is one of few CPU-side levers
   remaining.
-- **Deferred (no current phase planned)**: async / batched perceptual
-  render. Phase 6 investigation showed serial perceptual p50 (52 ms)
-  is dominated by `context.render(...)` GPU sync, not compute (parallel
-  throughput hits ~5 ms/iter). A 10× per-call latency cut is
-  theoretically available by replacing the sync render with batched
-  Metal command buffers, but it would change the diffing API surface
-  and isn't justified without a user demanding it.
+- **Phase 9** pending — internal coalescing-window batch for the
+  perceptual path. Sync `Diffing` API stays; under the hood, perceptual
+  compares enqueue onto a shared coordinator that submits up to N
+  pending requests in one Metal command buffer per coalescing window.
+  Amortizes the per-call GPU sync that dominates serial p50 (52 ms ≈
+  ~47 ms wait + ~5 ms compute). No public API change. Win is bounded
+  by the perceptual concurrency limiter — pairs with raising
+  `SNAPSHOT_TESTING_PERCEPTUAL_DIFF_CONCURRENCY` default.
+- **Deferred (no current phase planned)**: making the public `Diffing`
+  API async (Option A / B from the design discussion). Would unlock the
+  full ~10× perceptual win at the cost of source-incompatible breakage
+  or permanent dual-API surface. Phase 9 captures the source-compatible
+  ~2× without that cost; revisit only if a user reports the remaining
+  gap matters.
 
 ### Resume context
 
@@ -752,6 +759,121 @@ and amortizes the MPS construction cost across the whole suite.
 
 ---
 
+## Phase 9 — Internal coalescing batch for the perceptual path
+
+The Phase 6 follow-up showed perceptual serial p50 = 52 ms is mostly
+GPU-sync wait, not compute (parallel-N wall throughput is ~5 ms/iter).
+Each call submits one Metal command buffer and synchronously waits via
+`context.render(toBitmap:)`. If multiple calls were in flight, the GPU
+could keep itself busy and amortize that sync — but the public
+`Diffing.diffV2` closure is sync, so each caller blocks before the
+next can start.
+
+Phase 9 is the source-compatible way to capture most of that gap: keep
+the sync `Diffing` API, but inside the perceptual path push work
+through a private coordinator that coalesces up to N pending compares
+into a single submission per window. Each caller still blocks on its
+own result, but submissions overlap on the GPU instead of serializing.
+
+### Changes
+
+1. **`Sources/SnapshotTesting/Snapshotting/Internal/PerceptualBatchCoordinator.swift`**
+   (new) — small actor / serial-queue coordinator owning:
+   - A pending queue of `(oldCIImage, newCIImage, threshold,
+     pixelPrecision, completion)` records.
+   - A coalescing window `W` (e.g., 1-2 ms — long enough to gather
+     concurrent submissions, short enough not to add noticeable
+     per-call latency in low-load test runs).
+   - A worker that drains up to `N` pending records and submits them
+     together. Two valid implementations:
+     - **Same-thread, separate command buffers**: queue N
+       `CIContext.render` calls onto a shared dispatch queue without
+       per-call serializer; the GPU pipelines them. Simpler; gets
+       most of the win with minimal raw-Metal exposure.
+     - **One MTLCommandBuffer with all encodings**: encodes the LabΔE
+       + threshold + areaAverage chain for each pending request
+       manually, commits once, fans out completions. Bigger win, but
+       reaches under `CIContext` — substantially more code.
+   - The simpler shape is the right starting point; promote to the
+     manual-encoding shape only if bench numbers justify it.
+2. **`perceptuallyCompare` in `UIImage.swift` / `NSImage.swift`** —
+   replace direct `context.render(...)` calls with
+   `PerceptualBatchCoordinator.shared.submit(...)` + wait on a
+   per-call `DispatchSemaphore`. Caller-visible behavior unchanged
+   (still sync, still returns `String?`).
+3. **Tunables (env vars)**:
+   - `SNAPSHOT_TESTING_PERCEPTUAL_BATCH_WINDOW_US` — coalescing
+     window in microseconds (default ~1500 — long enough that the
+     dispatch wakeup is amortized, short enough to be invisible at
+     low load).
+   - `SNAPSHOT_TESTING_PERCEPTUAL_BATCH_MAX` — cap on requests per
+     batch (default = current `_PERCEPTUAL_DIFF_CONCURRENCY` value).
+   - Set window to 0 to disable batching (forces immediate
+     per-call submit; useful for diagnosis).
+4. **Pair with raising `SNAPSHOT_TESTING_PERCEPTUAL_DIFF_CONCURRENCY`
+   default** — the limiter was originally there to bound CIContext
+   alloc cost (Phase 2). With the pool fix + Phase 8's MPS cache, the
+   per-call CPU cost is small enough that the limiter is now what
+   *prevents* batching. Default likely moves from 2 to
+   `min(activeProcessorCount, 8)`. Validate with bench before flipping.
+
+### Verification
+
+- **Phase 7 prerequisite.** Without honest `--parallel N` worker pinning,
+  the win can't be measured cleanly.
+- `iphone-perceptual-pass` p50 expected to drop ~30-50 % at
+  `--parallel 4` / `8`; serial p50 drops less (the window adds latency
+  with no batching peer).
+- `iphone-perceptual-pass` parallel-N wall expected to drop ~30-50 %
+  at N ≥ 4; ideal world is ~5 ms/iter (GPU compute floor).
+- Peak RSS at parallel-8 should not regress; can drop modestly because
+  per-call MPS heaps overlap less.
+- Full XCTest suite green; perceptual edge-case tests
+  (`PerceptualPass`, `PerceptualFail`, plus existing perceptual
+  fixtures in `Tests/SnapshotTestingTests`) unchanged in pass / fail
+  outcomes.
+- A new bench scenario `iphone-perceptual-pass-batchable` that runs N
+  perceptual compares back-to-back without any sync points between
+  them, to validate the batching path actually engages.
+
+### Risks
+
+- **Cancellation / error propagation**: each pending request needs a
+  way to surface render errors back to its caller. Per-request
+  `Result<Float, Error>` slots solved by storing alongside the
+  semaphore.
+- **Deadlock under low load**: if only one perceptual call is in
+  flight, the coordinator must still drain when the window expires —
+  not wait for `N` to fill. A `DispatchSourceTimer` armed on each
+  enqueue handles this.
+- **Window tuning regresses single-test runs**: a 1.5 ms window is
+  a free 1.5 ms of latency on every isolated perceptual call. Mitigate
+  by short-circuiting when the queue is empty *and* no other request
+  has arrived within (say) 100 µs — i.e., adaptive window.
+- **Test isolation surprises**: if multiple `XCTestCase` classes ever
+  rely on perceptual compares completing before some side-effect, the
+  coordinator must be drained at process exit. `atexit` registration
+  or a `Task.detached` flush in the limiter is sufficient.
+
+### Out of scope
+
+- Public `Diffing` API changes (Option A / B from the design
+  discussion). Phase 9 stays under the existing sync surface.
+- Async `assertSnapshot` overload. The XCTest wrapper continues to
+  call sync `diffV2`; only the perceptual implementation pipelines
+  internally.
+- Batching the precision (CPU memcmp) path — already RAM-bandwidth-
+  bound; nothing to gain from coalescing.
+
+### Decision criteria for whether to ship
+
+If Phase 9 measurements at honest parallel-N show <20 % wall-time
+improvement on `iphone-perceptual-pass`, drop the phase and flip the
+limiter default instead (cheaper, simpler). The phase is only worth
+its complexity if the coalescing actually unlocks GPU pipelining.
+
+---
+
 ## Skipped from source doc
 
 - **#8 pixel-based precision** — deferred per decision above.
@@ -772,6 +894,7 @@ and amortizes the MPS construction cost across the whole suite.
 | 7 | Phase 6 (iOS-resolution bench scenarios) | none — bench-only | stable percentile measurements at iPhone (12 MB) & iPad (22 MB) buffer sizes; surfaces RSS profile under sustained load; produces decision data for any further optimization |
 | 8 | Phase 7 (`BenchRunner` pins to `--parallel N`) | none — bench-only | parallel-N wall times now scale monotonically with N; serial column unchanged |
 | 9 | Phase 8 (`MPSImageThresholdBinary` per-threshold cache) | low | iphone-perceptual-pass p50 drops modestly; peak RSS at honest `--parallel 8` flatter; full suite green |
+| 10 | Phase 9 (perceptual coalescing batch + raise limiter default) | medium | iphone-perceptual-pass parallel-N wall drops 30-50% at N≥4; serial unaffected; full suite green; ship/drop decision based on >20% wall improvement |
 
 Each PR description includes the bench CSV diff vs. the baseline committed in `bench-baseline/`.
 
