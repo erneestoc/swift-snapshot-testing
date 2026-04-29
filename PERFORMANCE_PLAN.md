@@ -54,13 +54,25 @@
   CG `draw` already runs faster than the RAM-bandwidth ceiling for two
   full memcpys, so bypassing it would save little. See Phase 6 Results
   for per-call → suite-level extrapolations.
-- **Phase 7** ✅ code `1799be3`. Replaced `DispatchQueue.concurrentPerform`
-  with N long-running workers pulling iterations from a shared counter,
-  joined via `DispatchGroup`. The CLI's `--parallel N` now caps in-flight
-  `runOnce()` calls to exactly N. Smoke run on `iphone-1px-diff` (iters=200):
-  serial 856 ms · p2 424 ms · p4 220 ms · p8 117 ms — near-linear scaling;
-  per-iter p50 stays ~4.2-4.5 ms across all N (work itself unchanged).
-  Bench-only, no library code touched.
+- **Phase 7** ✅ code `1799be3`, bench `2541c35`. Replaced
+  `DispatchQueue.concurrentPerform` with N long-running workers pulling
+  iterations from a shared counter, joined via `DispatchGroup`. The CLI's
+  `--parallel N` now caps in-flight `runOnce()` calls to exactly N.
+  Bench-only, no library code touched. Re-ran iOS suite at the new SHA
+  (`bench-results/2541c35-ios-*.csv` vs `eced587-ios-*.csv`):
+  - **Honest wall time**: parallel-4 wall grew on byte-loop scenarios
+    (e.g. `iphone-1px-diff` 393 ms → 1052 ms) because Phase 6 was
+    actually using all cores. Parallel-8 wall grew less (387 → 560 ms)
+    since 8 workers ≈ the machine.
+  - **Contention vanished**: `iphone-1px-diff` parallel-4 p95 13.35 ms
+    → 4.34 ms; `iphone-perceptual-pass` parallel-4 p95 110 ms → 62.6 ms.
+    Per-iter p50 across all N matches serial within noise.
+  - **Peak RSS drops at parallel-8**: iPad scenarios 1.57 GB → 1.01 GB;
+    `iphone-perceptual-pass` 1.86 GB → 1.44 GB. No more overcommit
+    inflating the in-flight buffer count.
+  Phase 6's three conclusions still hold under the new measurements
+  (canonical-layout fast-path not worth doing; `defer { deallocate() }`
+  returns pages cleanly; perceptual is the dominant per-call cost).
 - **Phase 8** pending — cache `MPSImageThresholdBinary` per threshold
   value in `ThresholdImageProcessorKernel`. Currently constructed every
   perceptual call (`UIImage.swift:548`); a small per-threshold cache
