@@ -517,6 +517,30 @@ private func normalizedComponentDiff(_ old: UIImage, _ new: UIImage) -> UIImage?
     static let inputThresholdKey = "thresholdValue"
     static let device = MTLCreateSystemDefaultDevice()
 
+    // MPS kernels are documented thread-safe for encoding once constructed.
+    // A typical suite uses 1-2 distinct perceptual precisions, so a tiny
+    // per-threshold cache eliminates the per-call MPS construction.
+    private static let kernelCacheLock = NSLock()
+    private static var kernelCache: [Float: MPSImageThresholdBinary] = [:]
+
+    private static func cachedKernel(
+      thresholdValue: Float, device: MTLDevice
+    ) -> MPSImageThresholdBinary {
+      kernelCacheLock.lock()
+      defer { kernelCacheLock.unlock() }
+      if let cached = kernelCache[thresholdValue] {
+        return cached
+      }
+      let kernel = MPSImageThresholdBinary(
+        device: device,
+        thresholdValue: thresholdValue,
+        maximumValue: 1.0,
+        linearGrayColorTransform: nil
+      )
+      kernelCache[thresholdValue] = kernel
+      return kernel
+    }
+
     static var isSupported: Bool {
       guard let device = device else {
         return false
@@ -545,12 +569,7 @@ private func normalizedComponentDiff(_ old: UIImage, _ new: UIImage) -> UIImage?
         return
       }
 
-      let threshold = MPSImageThresholdBinary(
-        device: device,
-        thresholdValue: thresholdValue,
-        maximumValue: 1.0,
-        linearGrayColorTransform: nil
-      )
+      let threshold = cachedKernel(thresholdValue: thresholdValue, device: device)
 
       threshold.encode(
         commandBuffer: commandBuffer,
