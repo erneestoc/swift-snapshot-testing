@@ -59,18 +59,42 @@ struct BenchRunner {
       }
       samples = local
     } else {
-      let lock = NSLock()
+      // N long-running workers pull iterations from a shared counter so that
+      // at most `parallelism` runOnce() calls are in flight at any moment.
+      // DispatchQueue.concurrentPerform would farm work onto GCD's global pool
+      // (sized to the full machine), defeating the --parallel N cap.
+      let total = scenario.iterations
+      let workerCount = min(parallelism, total)
+      let counterLock = NSLock()
+      var nextIteration = 0
+      let samplesLock = NSLock()
       var collected = [UInt64]()
-      collected.reserveCapacity(scenario.iterations)
-      DispatchQueue.concurrentPerform(iterations: scenario.iterations) { _ in
-        let t0 = BenchClock.now()
-        scenario.runOnce()
-        let t1 = BenchClock.now()
-        let ns = BenchClock.nanoseconds(from: t0, to: t1)
-        lock.lock()
-        collected.append(ns)
-        lock.unlock()
+      collected.reserveCapacity(total)
+      let queue = DispatchQueue.global(qos: .userInitiated)
+      let group = DispatchGroup()
+      for _ in 0..<workerCount {
+        queue.async(group: group) {
+          while true {
+            counterLock.lock()
+            let i = nextIteration
+            if i >= total {
+              counterLock.unlock()
+              return
+            }
+            nextIteration = i + 1
+            counterLock.unlock()
+
+            let t0 = BenchClock.now()
+            scenario.runOnce()
+            let t1 = BenchClock.now()
+            let ns = BenchClock.nanoseconds(from: t0, to: t1)
+            samplesLock.lock()
+            collected.append(ns)
+            samplesLock.unlock()
+          }
+        }
       }
+      group.wait()
       samples = collected
     }
 
