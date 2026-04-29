@@ -42,8 +42,11 @@
     held but peak RSS *grew* +33% as 16 hot buffers were retained
     process-wide — the opposite of the phase's goal. Reverted to raw
     allocation; the pool wasn't pulling weight beyond the zero-fill skip.
-- **Phase 6** pending — fast-path `context(for:)` for already-normalized images.
-  Highest remaining wall-time impact; depends on Phase 5.
+- **Phase 6** pending — extend bench harness with iOS-resolution scenarios
+  (iPhone 1179×2556 ≈ 12 MB/buffer, iPad 2064×2752 ≈ 22 MB/buffer) to
+  model real-world test suites with 10s of thousands of image snapshots.
+  Decides whether further optimizations (e.g., a canonical-layout
+  fast-path that bypasses `CGContext.draw`) are worth pursuing.
 
 ### Resume context
 
@@ -421,78 +424,112 @@ Notes:
 
 ---
 
-## Phase 6 — Fast-path `context(for:)` for already-normalized images (highest impact)
+## Phase 6 — iOS-resolution bench scenarios (model real-world workloads)
 
-The hot path always does `CGContext.draw(cgImage, …)` to produce the
-sRGB+RGBA8+premultipliedLast normalized buffer. But reference PNGs (decoded
-via `UIImage(data:)`) and snapshots produced through `UIGraphicsImageRenderer`
-typically arrive in *exactly* that layout already. For those, rasterization
-is wasted work — we could copy bytes straight from the source's
-`dataProvider`. This is the clearest remaining swing on the same hot path
-Phase 3 cracked open.
+Existing scenarios cap out at `exact-match-large` (4096×4096 synthetic,
+~64 MB per buffer) and `exact-match-mixed` (real PNG fixtures averaging
+much smaller). Neither models the actual workload that motivates this
+project: an iOS app's test suite running tens of thousands of view-snapshot
+assertions at simulator resolutions (iPhone 15 Pro = 1179×2556 ≈ 12 MB
+per RGBA buffer, iPad Pro 13" = 2064×2752 ≈ 22 MB).
 
-### Prerequisites
+That gap matters for two reasons:
+- **Decision-making**: any further optimization (e.g., a canonical-layout
+  fast-path that bypasses `CGContext.draw`) needs honest data at the size
+  regime where it would actually pay off. The 1024² byte-loop scenarios
+  Phase 5 wins on don't generalize cleanly to 12-22 MB buffers — `memcmp`
+  bandwidth, CG draw overhead, and per-call allocator behavior all shift.
+- **Confidence**: claiming "X% faster on real iOS suites" without bench
+  coverage at iOS sizes is hand-waving. This phase produces the data.
 
-- Phase 5 (buffer pool) should land first. The fast-path still needs a
-  destination buffer for the `memcpy`; the pool keeps it allocation-free.
-- A diverse fixture suite that exercises the layouts we *don't* fast-path
-  (P3, grayscale, non-premultiplied, padded `bytesPerRow`) — already largely
-  present in `ImageNormalizationEdgeCasesTests.swift`; extend with padded-row
-  + 16bpc + indexed-colorspace fixtures so the layout check is provably
-  correct against a comprehensive matrix.
+### Goal
+
+Add bench scenarios at iOS simulator resolutions, run them across the
+existing serial / parallel-4 / parallel-8 modes, and produce a
+`bench-results/<sha>-ios.csv` family that lets us reason about real-world
+suite-level wall time and RSS without extrapolation.
 
 ### Changes
 
-1. **`isCanonicalNormalizedLayout(_ cgImage:) -> Bool`** in
-   `Sources/SnapshotTesting/Snapshotting/Internal/ImageComparisonResources.swift`.
-   Returns true iff *all* the following hold:
-   - `cgImage.colorSpace?.name == CGColorSpace.sRGB` (exact match — not
-     `displayP3`, not `extendedSRGB`).
-   - `cgImage.bitsPerComponent == 8`.
-   - `cgImage.bitsPerPixel == 32`.
-   - `cgImage.alphaInfo == .premultipliedLast` (exactly).
-   - `cgImage.byteOrderInfo == .orderDefault` or `.order32Big`.
-   - `cgImage.bytesPerRow == cgImage.width * 4` (no row padding).
-   - `cgImage.bitmapInfo` does *not* contain `.floatComponents`.
-2. **`context(for:data:)` rewrite**: when `data` is non-nil and
-   `isCanonicalNormalizedLayout(cgImage)` returns true, copy bytes directly:
-   ```swift
-   if let provider = cgImage.dataProvider, let cf = provider.data {
-     let src = CFDataGetBytePtr(cf)!
-     memcpy(data, src, byteCount)
-     return nil  // signal: bytes were copied, no CGContext needed
-   }
-   ```
-   Adjust `compare()` callers to handle the "no context needed" return path
-   (they only use the context for its `data` pointer, which was already
-   populated).
-3. Behind a kill-switch env var
-   (`SNAPSHOT_TESTING_DISABLE_NORMALIZED_FASTPATH=1`) for one release in case
-   a project hits a layout the check misclassifies.
+1. **`Sources/SnapshotTestingBenchmarks/Fixtures/ImageFactory.swift`** —
+   add canonical-layout iOS-resolution synthetic generators:
+   - `iphoneScreenshot()` → 1179×2556 RGBA8 sRGB premultipliedLast
+     gradient. Buffer ≈ 12 MB.
+   - `ipadScreenshot()` → 2064×2752 RGBA8 sRGB premultipliedLast gradient.
+     Buffer ≈ 22 MB.
+   - `iphoneScreenshotWithDiff(at:)` → same as above but flips one pixel
+     at a configurable position to produce a controlled byte-diff.
+   These intentionally use the same canonical layout `context(for:)`
+   produces today (sRGB + 8bpc + 32bpp + premultipliedLast + no row
+   padding) so they exercise the fast path that hardware-rendered iOS
+   snapshots take.
+2. **`Sources/SnapshotTestingBenchmarks/Scenarios/IOSResolutionScenarios.swift`** —
+   new file with:
+   - `IPhoneExactMatch` — both inputs identical, exercises `memcmp`
+     short-circuit at 12 MB. Iterations: ~1000.
+   - `IPhone1pxDiff` — one pixel different, full byte loop at 12 MB.
+     Iterations: ~1000.
+   - `IPhonePrecision99` — `precision: 0.99`, ~0.4% of pixels different.
+     Iterations: ~500.
+   - `IPadExactMatch` — same shape at 22 MB. Iterations: ~500.
+   - `IPad1pxDiff` — full byte loop at 22 MB. Iterations: ~500.
+   - `IPadPrecision99` — `precision: 0.99` at 22 MB. Iterations: ~250.
+   - `IPhonePerceptualPass` — `perceptualPrecision: 0.99`, identical
+     12 MB inputs. Iterations: ~250.
+   Iteration counts target ~3-10 s wall time per scenario serial so
+   percentile measurements stabilize without blowing out CI; parallel
+   modes inherit the same per-scenario count.
+3. **`scripts/bench.sh`** — extend to invoke the new scenarios alongside
+   existing ones. Output filename pattern: `bench-results/<sha>-ios-{serial,parallel-4,parallel-8}.csv`
+   so the iOS suite can be diffed independently.
+4. **`PERFORMANCE_RESULTS.md`** — add an "iOS-resolution suite" section
+   once the first run lands, with extrapolation: at p50 latency `L` per
+   compare, a suite of `N` snapshots at this resolution costs `N × L`
+   wall time on a single thread, `N × L / workers` parallel.
 
 ### Verification
 
-- Bench: `exact-match-mixed` p50 serial should drop further (current 1.46ms;
-  expect <1ms — most fixtures are sRGB+RGBA8 PNGs); `precision-*` p50
-  similarly. Other scenarios unchanged.
-- Edge-case suite (Phase 3 follow-up) must stay green: P3, grayscale,
-  non-premultiplied images all take the slow path and produce identical
-  output.
-- New parity test: for each canonical-layout fixture, assert
-  `fastPathBytes == drawBasedBytes` (run both paths, byte-compare).
-- Run with `SNAPSHOT_TESTING_DISABLE_NORMALIZED_FASTPATH=1`: bench numbers
-  should match Phase 5 exactly.
+- New scenarios produce stable p50 numbers across three consecutive runs
+  (variance < 10%).
+- Peak RSS at parallel-8 stays bounded — no growth across iterations,
+  confirming Phase 5's `defer { deallocate() }` actually returns pages.
+  Sustained workload of 10 000+ compares at 22 MB buffers should not push
+  RSS above `(workers × 2 × 22 MB) + steady-state overhead` (~352 MB
+  worth of in-flight buffers at parallel-8, expected total RSS in the
+  4-5 GB range matching current numbers).
+- Existing scenarios' numbers unchanged (no regression from adding the
+  new scenarios — they're additive).
 
 ### Risks
 
-- Layout-check completeness: missing a subtle bit in `CGImage.bitmapInfo` or
-  misjudging `byteOrderInfo` would silently produce wrong bytes for
-  fast-pathed images. Mitigation: parity test above + start with the strictest
-  possible check (only the *exact* layout `context(for:)` produces today),
-  loosen later if measurement justifies it.
-- Performance regression for borderline-non-canonical images: the layout check
-  is cheap (~10 property reads) but called per `compare()`. Should be
-  unmeasurable, but verify in bench.
+- **Bench wall time grows**: 7 new scenarios × 3 modes (serial / p4 / p8)
+  add real time to every CI bench run. Mitigation: the new scenarios go in
+  a separate `--suite ios` flag that's opt-in for the bench script
+  (default keeps the current scenarios for fast iteration; `--suite all`
+  or `--suite ios` enables them).
+- **Synthetic vs. real fixtures**: a gradient PNG isn't byte-identical to
+  what `UIGraphicsImageRenderer` produces from a real SwiftUI/UIKit view
+  hierarchy. The synthetic image *is* in the canonical layout, which is
+  the realistic case for >90% of iOS snapshot tests, but a follow-up
+  could commit a small handful of real iOS-rendered PNG fixtures
+  (`Tests/SnapshotTestingTests/__Fixtures__/ios-screenshots/`) for
+  byte-true reproducibility.
+
+### Outcome (what this phase decides)
+
+After this phase produces results, we'll have evidence to answer:
+
+1. **Is a canonical-layout fast-path worth doing?** If iOS-resolution
+   `IPhoneExactMatch` and `IPad1pxDiff` show CG `draw` accounting for a
+   significant fraction of wall time (>30%), the fast-path is worth the
+   parity-test investment. If CG already memcpys internally for this
+   case, the win is near-zero and we skip it.
+2. **Does the Phase 5 RSS story hold at iOS sizes?** Half-RAM at parallel-8
+   on 1024² scenarios is a clean win, but 22 MB buffers may stress the
+   allocator differently. This phase is the proof.
+3. **What's the realistic CI-level speedup vs. baseline?** With per-call
+   numbers at iOS sizes, "Phase 5 makes a 10 000-snapshot iPad suite N
+   seconds faster" stops being a hand-wave.
 
 ---
 
@@ -513,7 +550,7 @@ Phase 3 cracked open.
 | 4 | Phase 3 (drop PNG round-trip) | medium | large gain on png-roundtrip & precision RSS; full suite green |
 | 5 | Phase 4 (UIGraphicsImageRenderer) | low | parity |
 | 6 | Phase 5 (normalized buffer pool) | low | flatter peak RSS at parallel-8; wall ≤ Phase 4 |
-| 7 | Phase 6 (fast-path normalized layout) | medium | further drop on `exact-match-mixed` & `precision-*`; full edge-case suite green |
+| 7 | Phase 6 (iOS-resolution bench scenarios) | none — bench-only | stable percentile measurements at iPhone (12 MB) & iPad (22 MB) buffer sizes; surfaces RSS profile under sustained load; produces decision data for any further optimization |
 
 Each PR description includes the bench CSV diff vs. the baseline committed in `bench-baseline/`.
 
