@@ -161,8 +161,21 @@
   **126 → 74 ms (−42%)**, compare_p50 **78 → 24 ms (−69%)**.
   parallel-8 gain identical (no contention). Fail-path total
   unchanged within ±0.5%. All 40 XCTests pass, all committed PNG
-  references byte-identical (sha unchanged before/after run). Bench
-  `bench-results/8c30049-dirty-pipeline-{serial,parallel-4,parallel-8}.csv`.
+  references byte-identical (sha unchanged before/after run). Code
+  `07c35a5`, bench
+  `bench-results/07c35a5-pipeline-{serial,parallel-4,parallel-8}.csv`.
+- **Phase 12-B** ✅ parallelize the two compare-side redraws. New
+  `loadNormalizedCompareBufferPair` dispatches both
+  `loadNormalizedCompareBuffer` calls via
+  `concurrentPerform(iterations: 2)` when `byteCount > 256 KB`;
+  serial below the threshold to avoid dispatch overhead exceeding
+  conversion cost. Stacks on top of 12-A: `pipeline-large-iphone`
+  parallel-8 total p50 **74 → 70 ms (−5%)**, compare **23 → 20 ms
+  (−14%)**. No parallel-mode regression — byte-count gate keeps
+  small images on the serial path. Combined 12-A+B vs Phase 9
+  baseline: parallel-8 `pipeline-large-iphone` **127 → 70 ms
+  (−45%)**, serial `126 → 72 ms (−43%)`. Code `d77f332`, bench
+  `bench-results/d77f332-pipeline-{serial,parallel-4,parallel-8}.csv`.
 - **Deferred (replaced by current Phase 9)**: perceptual coalescing
   batch + raising `SNAPSHOT_TESTING_PERCEPTUAL_DIFF_CONCURRENCY`
   default. Would optimize the perceptual path further, but perceptual
@@ -1316,7 +1329,17 @@ sRGB + premultipliedLast + tight stride).
   behind a runtime check that both source and destination are in
   the "safe" format space and fall back otherwise.
 
-#### B. Parallelize the two compare-side redraws
+#### B. Parallelize the two compare-side redraws — ✅ shipped
+
+**Result (commit `d77f332`):** parallel-8 `pipeline-large-iphone`
+total p50 **74 → 70 ms (−5% atop A)**, compare **23 → 20 ms
+(−14%)**. Smaller than the projected ~9 ms savings — dispatch
+overhead and L3/memory-bandwidth contention on the 12 MB working
+set damp the win — but real and consistent across modes. No
+parallel-mode regression: the `byteCount > 256 KB` gate keeps
+small images on the serial path. Implementation:
+`loadNormalizedCompareBufferPair` in
+`Sources/SnapshotTesting/Snapshotting/Internal/CompareBufferLoader.swift`.
 
 Today `compare()` runs ref-redraw → new-redraw → memcmp serially.
 Both redraws are CPU-bound, independent, and write to separate
