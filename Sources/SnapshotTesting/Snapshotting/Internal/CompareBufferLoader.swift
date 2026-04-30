@@ -61,6 +61,42 @@
   /// `CGContext.draw` on the format pairs the snapshot pipeline produces.
   /// Falls back to `CGContext.draw` for source formats vImage rejects (rare:
   /// indexed color, planar layouts, exotic float formats).
+  /// Byte-count threshold above which `loadNormalizedCompareBufferPair`
+  /// dispatches the two redraws across two threads. Below this, the
+  /// thread-pool dispatch overhead exceeds the conversion cost itself.
+  /// 256 KB ≈ 256×256 RGBA8; small assertions stay on the serial path.
+  private let compareParallelByteThreshold: Int = 256 * 1024
+
+  /// Load both reference and candidate buffers. For images large enough
+  /// to amortize dispatch overhead, both `loadNormalizedCompareBuffer`
+  /// calls run concurrently via `concurrentPerform(iterations: 2)`. For
+  /// small images, they run serially to avoid thread-pool overhead.
+  ///
+  /// Returns `(oldOK, newOK)`. Both buffers are written before return.
+  /// The two writes target disjoint allocations and `concurrentPerform`
+  /// barriers on completion, so reads after this call are race-free.
+  func loadNormalizedCompareBufferPair(
+    oldCgImage: CGImage, oldBuffer: UnsafeMutableRawPointer,
+    newCgImage: CGImage, newBuffer: UnsafeMutableRawPointer,
+    byteCount: Int
+  ) -> (oldOK: Bool, newOK: Bool) {
+    if byteCount <= compareParallelByteThreshold {
+      let oldOK = loadNormalizedCompareBuffer(from: oldCgImage, into: oldBuffer)
+      let newOK = loadNormalizedCompareBuffer(from: newCgImage, into: newBuffer)
+      return (oldOK, newOK)
+    }
+    var oldOK = false
+    var newOK = false
+    DispatchQueue.concurrentPerform(iterations: 2) { idx in
+      if idx == 0 {
+        oldOK = loadNormalizedCompareBuffer(from: oldCgImage, into: oldBuffer)
+      } else {
+        newOK = loadNormalizedCompareBuffer(from: newCgImage, into: newBuffer)
+      }
+    }
+    return (oldOK, newOK)
+  }
+
   @discardableResult
   func loadNormalizedCompareBuffer(
     from cgImage: CGImage,

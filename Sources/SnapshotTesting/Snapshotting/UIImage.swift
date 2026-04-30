@@ -125,12 +125,17 @@
     // destination byte on draw.
     let oldBuffer = UnsafeMutableRawPointer.allocate(byteCount: byteCount, alignment: 16)
     defer { oldBuffer.deallocate() }
-    guard loadNormalizedCompareBuffer(from: oldCgImage, into: oldBuffer) else {
-      return "Reference image's data could not be loaded."
-    }
     let newBuffer = UnsafeMutableRawPointer.allocate(byteCount: byteCount, alignment: 16)
     defer { newBuffer.deallocate() }
-    guard loadNormalizedCompareBuffer(from: newCgImage, into: newBuffer) else {
+    let loaded = loadNormalizedCompareBufferPair(
+      oldCgImage: oldCgImage, oldBuffer: oldBuffer,
+      newCgImage: newCgImage, newBuffer: newBuffer,
+      byteCount: byteCount
+    )
+    guard loaded.oldOK else {
+      return "Reference image's data could not be loaded."
+    }
+    guard loaded.newOK else {
       return "Newly-taken snapshot's data could not be loaded."
     }
     if memcmp(oldBuffer, newBuffer, byteCount) == 0 { return nil }
